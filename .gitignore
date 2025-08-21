@@ -13,3 +13,15 @@ web/.env.local
 
 # misc
 .DS_Store
+.venv/
+__pycache__/
+.DS_Store
+.env
+.python-version
+.vscode/
+.idea/
+node_modules/
+.next/
+.vercel/
+.pytest_cache/
+.mypy_cache/
