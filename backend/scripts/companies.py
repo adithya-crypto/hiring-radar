@@ -29,7 +29,7 @@ CANDIDATES = [
     "mural","monday","miro","trello","pagerduty","newrelic","evernote","intercom",
     "wise","transferwise","revolut","monzo","nubank","klarna","brevo","typeform",
     "reddit","hashicorp","discord","roblox","nvidia","openai","anthropic","datastax",
-    "snowplow","segment","bolt","postman","retool","vercel","netlify","zapier",
+    "snowplow","segment","bolt","postman","retool","vercel","netlify","zapier","oracle"
 ]
 
 TIMEOUT = 12
