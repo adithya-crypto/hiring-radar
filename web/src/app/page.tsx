@@ -1,18 +1,32 @@
 'use client'
 import React, { useEffect, useMemo, useState } from 'react'
 
-const API = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000'
+/**
+ * API base:
+ * - Prefer NEXT_PUBLIC_API_BASE if set (Vercel)
+ * - Fallback to Render API on vercel.app
+ * - Else default to localhost (dev)
+ */
+const API =
+  process.env.NEXT_PUBLIC_API_BASE
+  || (typeof window !== 'undefined' && window.location.hostname.endsWith('vercel.app')
+      ? 'https://hiring-radar-api.onrender.com'
+      : 'http://localhost:8000')
 
-type Score = {
-  id?: number
+type MetricsRow = {
   company_id: number
-  role_family: string
-  score: number
-  computed_at?: string
-  details_json?: { open_now?: number; new_last_4w?: number }
-  evidence_urls?: string[]
-  open_count?: number
-  company_name?: string
+  company_name: string
+  sde_openings: number
+  sde_new: number
+  sde_closed: number
+}
+
+type UiRow = {
+  company_id: number
+  company_name: string
+  score: number        // we define as sde_new (new postings this week)
+  open_now: number     // sde_openings
+  new_28d: number      // sde_new
 }
 
 type Company = { id: number; name: string; ticker?: string | null }
@@ -61,7 +75,7 @@ function isUS(loc?: string | null): boolean {
 }
 
 export default function Page() {
-  const [scores, setScores] = useState<Score[]>([])
+  const [rows, setRows] = useState<UiRow[]>([])
   const [companies, setCompanies] = useState<Record<number, Company>>({})
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -72,11 +86,6 @@ export default function Page() {
 
   const [mode, setMode] = useState<ViewMode>('top')
   const [newDays, setNewDays] = useState<7 | 14 | 30>(7)
-
-  // Evidence modal
-  const [evidenceOpen, setEvidenceOpen] = useState(false)
-  const [evidenceFor, setEvidenceFor] = useState<string>('')
-  const [evidenceLinks, setEvidenceLinks] = useState<string[]>([])
 
   // Company panel
   const [companyPanelOpen, setCompanyPanelOpen] = useState(false)
@@ -97,12 +106,23 @@ export default function Page() {
     [panelCompanyId, companies]
   )
 
+  // Normalize API rows -> UI rows
+  const normalize = (arr: MetricsRow[]): UiRow[] =>
+    arr.map(r => ({
+      company_id: r.company_id,
+      company_name: r.company_name,
+      score: r.sde_new,          // define “score” = new postings this week
+      open_now: r.sde_openings,  // total open SDE
+      new_28d: r.sde_new,        // expose as column too
+    }))
+
   async function fetchTop() {
     setBusy(true); setError(null)
     try {
       const [sRes, cRes] = await Promise.all([
-        fetch(`${API}/active_top?role_family=SDE&limit=50`),
-        fetch(`${API}/companies`),
+        // NOTE: backend expects `family`, not role_family
+        fetch(`${API}/active_top?family=swe&limit=50`, { cache: 'no-store' }),
+        fetch(`${API}/companies`, { cache: 'no-store' }),
       ])
       if (!sRes.ok) throw new Error(`GET /active_top ${sRes.status}`)
       if (!cRes.ok) throw new Error(`GET /companies ${cRes.status}`)
@@ -110,7 +130,8 @@ export default function Page() {
       const cmap: Record<number, Company> = {}
       ;(companiesJson as Company[]).forEach((c) => (cmap[c.id] = c))
       setCompanies(cmap)
-      setScores((scoresJson as Score[]).sort((a, b) => b.score - a.score))
+      const ui = normalize(scoresJson as MetricsRow[])
+      setRows(ui.sort((a, b) => (b.score - a.score) || (b.open_now - a.open_now)))
     } catch (e: any) {
       setError(e?.message || 'Failed to load data')
     } finally { setBusy(false); setLoading(false) }
@@ -120,8 +141,9 @@ export default function Page() {
     setBusy(true); setError(null)
     try {
       const [sRes, cRes] = await Promise.all([
-        fetch(`${API}/active_top_new?role_family=SDE&days=${days}&limit=50`),
-        fetch(`${API}/companies`),
+        // If your /active_top_new returns older shape, you can switch this to /scores or keep /active_top.
+        fetch(`${API}/active_top_new?role_family=SDE&days=${days}&limit=50`, { cache: 'no-store' }),
+        fetch(`${API}/companies`, { cache: 'no-store' }),
       ])
       if (!sRes.ok) throw new Error(`GET /active_top_new ${sRes.status}`)
       if (!cRes.ok) throw new Error(`GET /companies ${cRes.status}`)
@@ -129,7 +151,9 @@ export default function Page() {
       const cmap: Record<number, Company> = {}
       ;(companiesJson as Company[]).forEach((c) => (cmap[c.id] = c))
       setCompanies(cmap)
-      setScores((scoresJson as Score[]).sort((a, b) => b.score - a.score))
+      // Attempt to normalize; if your /active_top_new uses same fields, this works.
+      const ui = normalize(scoresJson as MetricsRow[])
+      setRows(ui.sort((a, b) => (b.score - a.score) || (b.open_now - a.open_now)))
     } catch (e: any) {
       setError(e?.message || 'Failed to load data')
     } finally { setBusy(false); setLoading(false) }
@@ -137,20 +161,12 @@ export default function Page() {
 
   useEffect(() => { fetchTop() }, [])
 
-  const filtered = scores.filter((s) => {
-    const meetsScore = s.score >= minScore
-    const name = companies[s.company_id]?.name?.toLowerCase() || ''
+  const filtered = rows.filter((r) => {
+    const meetsScore = r.score >= minScore
+    const name = r.company_name?.toLowerCase() || ''
     const meetsQuery = debouncedQuery ? name.includes(debouncedQuery) : true
     return meetsScore && meetsQuery
   })
-
-  function openEvidence(companyId: number) {
-    const name = companies[companyId]?.name || String(companyId)
-    const row = scores.find((r) => r.company_id === companyId)
-    setEvidenceFor(name)
-    setEvidenceLinks(row?.evidence_urls || [])
-    setEvidenceOpen(true)
-  }
 
   async function openCompanyPanel(companyId: number, tf: TimeFilter = 'all') {
     setPanelCompanyId(companyId)
@@ -163,7 +179,7 @@ export default function Page() {
     setPanelLoading(true)
     try {
       const url = new URL(`${API}/companies/${companyId}/postings`)
-      url.searchParams.set('role_family', 'SDE')
+      url.searchParams.set('role_family', 'SDE') // backend accepts this in CRUD
       switch (tf) {
         case '24h': url.searchParams.set('since_hours', '24'); break
         case '48h': url.searchParams.set('since_hours', '48'); break
@@ -174,11 +190,11 @@ export default function Page() {
         case 'all':
         default: break
       }
-      const r = await fetch(url.toString())
+      const r = await fetch(url.toString(), { cache: 'no-store' })
       if (!r.ok) throw new Error(`GET /companies/${companyId}/postings ${r.status}`)
       const data = (await r.json()) as Posting[]
       setPanelPostings(data)
-    } catch (e) {
+    } catch {
       setPanelPostings([])
     } finally { setPanelLoading(false) }
   }
@@ -317,7 +333,7 @@ export default function Page() {
                 type="number"
                 value={minScore}
                 min={0}
-                max={100}
+                max={1000}
                 onChange={(e) => setMinScore(Number(e.target.value))}
                 className="w-24 rounded-lg border px-2 py-2 text-sm"
               />
@@ -343,47 +359,40 @@ export default function Page() {
             <thead className="sticky top-0 z-10 bg-white/95 backdrop-blur text-left text-xs font-medium text-zinc-600">
               <tr className="border-b">
                 <th className="p-3">Company</th>
-                <th className="w-24 p-3">Score</th>
+                <th className="w-24 p-3">Score (new)</th>
                 <th className="w-32 p-3">Open SDE</th>
                 <th className="w-32 p-3">New (28d)</th>
-                <th className="w-28 p-3">Evidence</th>
+                <th className="w-28 p-3">Openings</th>
               </tr>
             </thead>
             <tbody className="divide-y">
               {loading
                 ? Array.from({ length: 10 }).map((_, i) => shimmerRow(i))
                 : filtered.length > 0
-                  ? filtered.map((s) => (
-                      <tr key={`${s.company_id}-${s.role_family}`} className="hover:bg-zinc-50">
+                  ? filtered.map((r) => (
+                      <tr key={r.company_id} className="hover:bg-zinc-50">
                         <td className="p-3">
                           <div className="flex items-center gap-2">
                             <button
                               className="truncate text-sm font-medium text-blue-600 hover:underline"
-                              onClick={() => openCompanyPanel(s.company_id, 'all')}
+                              onClick={() => openCompanyPanel(r.company_id, 'all')}
                               title="View openings"
                             >
-                              {companies[s.company_id]?.name || s.company_id}
+                              {r.company_name}
                             </button>
-                            {s.score >= 20 && badge('Active', 'emerald')}
-                          </div>
-                          <div className="mt-0.5 text-xs text-zinc-500">
-                            {s.computed_at ? new Date(s.computed_at).toLocaleString() : ''}
+                            {r.score >= 20 && badge('Active', 'emerald')}
                           </div>
                         </td>
-                        <td className="p-3 align-top">{s.score}</td>
-                        <td className="p-3 align-top">{s.details_json?.open_now ?? s.open_count ?? '—'}</td>
-                        <td className="p-3 align-top">{s.details_json?.new_last_4w ?? '—'}</td>
+                        <td className="p-3 align-top">{r.score}</td>
+                        <td className="p-3 align-top">{r.open_now}</td>
+                        <td className="p-3 align-top">{r.new_28d}</td>
                         <td className="p-3 align-top">
-                          {(s.evidence_urls?.length ?? 0) > 0 ? (
-                            <button
-                              className="rounded-lg border px-2 py-1 text-xs hover:bg-zinc-50"
-                              onClick={() => openEvidence(s.company_id)}
-                            >
-                              View
-                            </button>
-                          ) : (
-                            <span className="text-zinc-400 text-xs">—</span>
-                          )}
+                          <button
+                            className="rounded-lg border px-2 py-1 text-xs hover:bg-zinc-50"
+                            onClick={() => openCompanyPanel(r.company_id)}
+                          >
+                            View
+                          </button>
                         </td>
                       </tr>
                     ))
@@ -399,35 +408,6 @@ export default function Page() {
           </table>
         </div>
       </div>
-
-      {/* Evidence modal */}
-      {evidenceOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-lg rounded-2xl bg-white shadow-xl">
-            <div className="flex items-center justify-between border-b p-4">
-              <h3 className="text-base font-semibold">Evidence — {evidenceFor}</h3>
-              <button className="rounded px-2 py-1 text-sm hover:bg-zinc-100" onClick={() => setEvidenceOpen(false)}>
-                Close
-              </button>
-            </div>
-            <div className="p-4">
-              {evidenceLinks.length > 0 ? (
-                <ul className="list-disc space-y-2 pl-5">
-                  {evidenceLinks.map((u, i) => (
-                    <li key={i} className="break-all text-sm">
-                      <a href={u} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">
-                        {u}
-                      </a>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="text-sm text-zinc-500">No recent apply links available.</p>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Company slide-over */}
       {companyPanelOpen && (
