@@ -10,10 +10,10 @@ from sqlalchemy import text
 from fastapi.responses import JSONResponse
 
 from .jobs.run_discovery import run_discovery_now
-from app.db import get_db  # <-- use the shared dependency (remove local duplicate)
+# REMOVED: from app.db import get_db  # we define a local get_db below
 
 from .config import settings
-from .db import SessionLocal  # used by get_db in app.db
+from .db import SessionLocal  # used by local get_db
 from . import crud
 from .forecast import forecast_month
 from .models import Signal
@@ -25,6 +25,7 @@ try:
 except Exception:
     attach_scheduler = None  # ok if not available in local dev
 
+
 # ----- FastAPI app -----
 app = FastAPI(title="Hiring Radar API", version="0.1.0")
 
@@ -35,6 +36,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ----- DB session dependency (local) -----
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 
 # ----- Models for request bodies -----
 class CompanyIn(BaseModel):
