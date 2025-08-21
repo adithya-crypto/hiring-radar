@@ -1,29 +1,30 @@
-# backend/app/main.py
 from datetime import datetime
 import traceback
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from fastapi.responses import JSONResponse
 
+from app.db import get_db  # shared DB dependency
 from .config import settings
-from .db import SessionLocal
 from . import crud
 from .forecast import forecast_month
 from .models import Signal
-
-# Optional tasks
 from .jobs.run_discovery import run_discovery_now
+
+# Optional scheduler (hourly ingest / daily forecast)
 try:
     from .jobs.scheduler import attach_scheduler
 except Exception:
-    attach_scheduler = None
+    attach_scheduler = None  # fine for local/dev
 
-# ----- FastAPI app -----
+# -----------------------------
+# FastAPI app
+# -----------------------------
 app = FastAPI(title="Hiring Radar API", version="0.1.0")
 
 app.add_middleware(
@@ -34,15 +35,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----- DB session dependency (local; do NOT import from app.db on Render) -----
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# ----- Models for request bodies -----
+# -----------------------------
+# Request models
+# -----------------------------
 class CompanyIn(BaseModel):
     name: str
     careers_url: str
@@ -54,7 +49,9 @@ class SignalIn(BaseModel):
     happened_at: datetime
     payload_json: Optional[Dict[str, Any]] = None
 
-# ----- Health -----
+# -----------------------------
+# Health
+# -----------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -64,7 +61,9 @@ def health_db(db: Session = Depends(get_db)):
     db.execute(text("select 1"))
     return {"ok": True}
 
-# ----- Companies -----
+# -----------------------------
+# Companies
+# -----------------------------
 @app.get("/companies")
 def list_companies(db: Session = Depends(get_db)):
     return crud.list_companies(db)
@@ -103,6 +102,7 @@ def company_postings(
     obj = crud.company_detail(db, company_id)
     if not obj:
         raise HTTPException(status_code=404, detail="company_not_found")
+
     return crud.list_company_postings(
         db,
         company_id=company_id,
@@ -111,7 +111,9 @@ def company_postings(
         since_days=since_days,
     )
 
-# ----- Signals -----
+# -----------------------------
+# Signals
+# -----------------------------
 @app.post("/signals")
 def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
     s = Signal(
@@ -125,41 +127,77 @@ def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
     db.refresh(s)
     return {"ok": True, "id": s.id}
 
-# ----- Scores / Active (original: from hiring_score) -----
-@app.get("/scores")
-def scores(db: Session = Depends(get_db), role_family: str = "SDE", limit: int = 50):
-    """Latest scores per company for role_family from hiring_score."""
-    return crud.list_scores(db, role_family=role_family, limit=limit)
+# -----------------------------
+# Scores / Active (from job_metrics)
+# Robust handling of role_family and week
+# -----------------------------
+FAMILY_FILTER = "lower(jm.role_family) IN ('swe','software','sde')"
+LATEST_WEEK_SQL = "(SELECT date_trunc('week', MAX(week_start)) FROM job_metrics)"
 
-@app.get("/active")
-def active(
-    role_family: str = "SDE",
-    min_score: int = 20,
-    db: Session = Depends(get_db),
-):
-    rows = crud.list_scores(db, role_family=role_family)
-    return [r for r in rows if r.get("score", 0) >= min_score]
+@app.get("/scores")
+def scores(db: Session = Depends(get_db), limit: int = 50):
+    """
+    Latest-week metrics from job_metrics. Robust to 'swe'/'software'/'sde' labels.
+    Always returns JSON (even on error).
+    """
+    try:
+        sql = text(f"""
+            SELECT
+              c.id   AS company_id,
+              c.name AS company_name,
+              jm.sde_openings,
+              jm.sde_new,
+              jm.sde_closed
+            FROM job_metrics jm
+            JOIN companies  c ON c.id = jm.company_id
+            WHERE jm.week_start = {LATEST_WEEK_SQL}
+              AND {FAMILY_FILTER}
+            ORDER BY jm.sde_openings DESC, jm.sde_new DESC, c.name
+            LIMIT :limit
+        """)
+        rows = db.execute(sql, {"limit": limit}).mappings().all()
+        return JSONResponse(content=[dict(r) for r in rows])
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": "scores_failed", "detail": str(e)})
 
 @app.get("/active_top")
-def active_top(
-    role_family: str = "SDE",
-    limit: int = Query(50, ge=1, le=200),
-    db: Session = Depends(get_db),
-):
-    """Top companies by latest score (requires hiring_score to be populated)."""
+def active_top(db: Session = Depends(get_db), limit: int = Query(50, ge=1, le=200)):
+    """
+    Top companies by new SWE postings for the latest week with data.
+    Robust to role_family label differences and always returns JSON.
+    """
     try:
-        return crud.list_active_top(db, role_family=role_family, limit=limit)
+        sql = text(f"""
+            SELECT
+              c.id   AS company_id,
+              c.name AS company_name,
+              jm.sde_new,
+              jm.sde_openings,
+              jm.sde_closed
+            FROM job_metrics jm
+            JOIN companies c ON c.id = jm.company_id
+            WHERE jm.week_start = {LATEST_WEEK_SQL}
+              AND {FAMILY_FILTER}
+              AND (jm.sde_openings > 0 OR jm.sde_new > 0)
+            ORDER BY jm.sde_new DESC, jm.sde_openings DESC, c.name
+            LIMIT :limit
+        """)
+        rows = db.execute(sql, {"limit": limit}).mappings().all()
+        return [dict(r) for r in rows]
     except Exception as e:
-        tb = traceback.format_exc()
-        print("[/active_top] error:", repr(e), "\n", tb)
         return JSONResponse(status_code=500, content={"error": "active_top_failed", "detail": str(e)})
+
+# Legacy/aux flows (left as-is, still useful)
+@app.get("/active")
+def active(role_family: str = "SDE", min_score: int = 20, db: Session = Depends(get_db)):
+    rows = crud.list_scores(db, role_family)
+    return [r for r in rows if r["score"] >= min_score]
 
 @app.get("/new_companies")
 def new_companies(days: int = 7, db: Session = Depends(get_db)):
     try:
         return crud.list_new_companies(db, days=days)
     except Exception as e:
-        print("[/new_companies] error:", repr(e))
         return {"error": "new_companies_failed", "detail": str(e)}
 
 @app.get("/active_top_new")
@@ -169,18 +207,19 @@ def active_top_new(
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    """Top N 'new' companies in the last {days} days by latest score."""
     try:
         return crud.list_active_top_new(db, role_family=role_family, days=days, limit=limit)
     except Exception as e:
-        print("[/active_top_new] error:", repr(e))
         return {"error": "active_top_new_failed", "detail": str(e)}
 
-# ----- Tasks: discover / ingest / forecast -----
+# -----------------------------
+# Tasks: discover / ingest / forecast
+# -----------------------------
 @app.post("/tasks/discover")
 def run_discover(db: Session = Depends(get_db)):
     try:
         disc = run_discovery_now(db)
+        # optionally chain ingest + forecast
         try:
             from .jobs.run_ingest import run_ingest_now
             ing = run_ingest_now(db)
@@ -199,7 +238,8 @@ def run_discover(db: Session = Depends(get_db)):
 def run_ingest(db: Session = Depends(get_db)):
     try:
         from .jobs.run_ingest import run_ingest_now
-        return run_ingest_now(db)
+        result = run_ingest_now(db)
+        return result
     except Exception as e:
         return {"error": "ingest_failed", "detail": str(e)}
 
@@ -211,15 +251,15 @@ def run_forecast(db: Session = Depends(get_db)):
         return {"forecasted": n}
     except Exception as e:
         tb = traceback.format_exc()
-        print("[/tasks/forecast] error:", repr(e), "\n", tb)
-        return {"error": "forecast_failed", "detail": str(e)}
+        return {"error": "forecast_failed", "detail": str(e), "trace": tb}
 
-# ----- Forecast (per company) -----
+# -----------------------------
+# Forecast (per company) & debug
+# -----------------------------
 @app.get("/forecast/{company_id}")
 def forecast_company(company_id: int, db: Session = Depends(get_db)):
     return forecast_month(db, company_id)
 
-# ----- Debug: latest raw payload sample -----
 @app.get("/debug/raw/{company_id}")
 def latest_raw(company_id: int, db: Session = Depends(get_db)):
     from .models import JobRaw
@@ -231,7 +271,9 @@ def latest_raw(company_id: int, db: Session = Depends(get_db)):
     )
     return {"ok": True, "payload": row.payload_json if row else []}
 
-# ----- Attach scheduler (optional) -----
+# -----------------------------
+# Attach scheduler (optional)
+# -----------------------------
 if attach_scheduler is not None:
     try:
         attach_scheduler(app)
