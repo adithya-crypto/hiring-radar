@@ -147,69 +147,37 @@ def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
 def scores(db: Session = Depends(get_db), family: str = "swe", limit: int = 50):
     """
     Current-week scores from job_metrics.
-    family: preferred family label; we also accept 'software' alias.
+    Prefer 'swe' rows; fall back to 'software' to avoid duplicates.
     """
     sql = text("""
-        SELECT
-          c.id           AS company_id,
-          c.name         AS company_name,
-          jm.sde_openings,
-          jm.sde_new,
-          jm.sde_closed
-        FROM job_metrics jm
-        JOIN companies  c ON c.id = jm.company_id
-        WHERE jm.week_start = date_trunc('week', now())
-          AND jm.role_family IN (:family, 'software')
-        ORDER BY jm.sde_openings DESC, jm.sde_new DESC, c.name
+        WITH picked AS (
+          SELECT
+            jm.company_id,
+            c.name AS company_name,
+            jm.sde_openings,
+            jm.sde_new,
+            jm.sde_closed,
+            CASE WHEN jm.role_family = 'swe' THEN 0 ELSE 1 END AS fam_rank
+          FROM job_metrics jm
+          JOIN companies c ON c.id = jm.company_id
+          WHERE jm.week_start = date_trunc('week', now())
+            AND jm.role_family IN (:family, 'software')
+        ),
+        ranked AS (
+          SELECT
+            *,
+            ROW_NUMBER() OVER (PARTITION BY company_id ORDER BY fam_rank) AS rn
+          FROM picked
+        )
+        SELECT company_id, company_name, sde_openings, sde_new, sde_closed
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY sde_openings DESC, sde_new DESC, company_name
         LIMIT :limit
     """)
     rows = db.execute(sql, {"family": family, "limit": limit}).mappings().all()
     return [dict(r) for r in rows]
 
-
-@app.get("/active")
-def active(
-    role_family: str = "SDE", min_score: int = 20, db: Session = Depends(get_db)
-):
-    # Legacy: uses CRUD’s older scoring; keep as-is for now
-    rows = crud.list_scores(db, role_family)
-    return [r for r in rows if r["score"] >= min_score]
-
-
-@app.get("/active_top")
-def active_top(
-    family: str = "swe",
-    limit: int = Query(50, ge=1, le=200),
-    db: Session = Depends(get_db),
-):
-    """
-    Top N companies for the current week by new SWE postings (from job_metrics).
-    Accepts 'swe' or 'software' family labels.
-    """
-    try:
-        sql = text("""
-            SELECT
-              c.id   AS company_id,
-              c.name AS company_name,
-              jm.sde_new,
-              jm.sde_openings,
-              jm.sde_closed
-            FROM job_metrics jm
-            JOIN companies c ON c.id = jm.company_id
-            WHERE jm.week_start = date_trunc('week', now())
-              AND jm.role_family IN (:family, 'software')
-              AND (jm.sde_openings > 0 OR jm.sde_new > 0)
-            ORDER BY jm.sde_new DESC, jm.sde_openings DESC, c.name
-            LIMIT :limit
-        """)
-        rows = db.execute(sql, {"family": family, "limit": limit}).mappings().all()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        tb = traceback.format_exc()
-        print("[/active_top] error:", repr(e), "\n", tb)
-        return JSONResponse(
-            status_code=500, content={"error": "active_top_failed", "detail": str(e)}
-        )
 
 
 @app.get("/active_top_new")
@@ -226,6 +194,52 @@ def active_top_new(
         print("[/active_top_new] error:", repr(e))
         return {"error": "active_top_new_failed", "detail": str(e)}
 
+@app.get("/active_top")
+def active_top(
+    family: str = "swe",
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """
+    Top N companies for the current week by new SWE postings.
+    Prefer 'swe' rows; fall back to 'software' to avoid duplicates.
+    """
+    try:
+        sql = text("""
+            WITH picked AS (
+              SELECT
+                jm.company_id,
+                c.name AS company_name,
+                jm.sde_new,
+                jm.sde_openings,
+                jm.sde_closed,
+                CASE WHEN jm.role_family = 'swe' THEN 0 ELSE 1 END AS fam_rank
+              FROM job_metrics jm
+              JOIN companies c ON c.id = jm.company_id
+              WHERE jm.week_start = date_trunc('week', now())
+                AND jm.role_family IN (:family, 'software')
+                AND (jm.sde_openings > 0 OR jm.sde_new > 0)
+            ),
+            ranked AS (
+              SELECT
+                *,
+                ROW_NUMBER() OVER (PARTITION BY company_id ORDER BY fam_rank) AS rn
+              FROM picked
+            )
+            SELECT company_id, company_name, sde_new, sde_openings, sde_closed
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY sde_new DESC, sde_openings DESC, company_name
+            LIMIT :limit
+        """)
+        rows = db.execute(sql, {"family": family, "limit": limit}).mappings().all()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("[/active_top] error:", repr(e), "\n", tb)
+        return JSONResponse(
+            status_code=500, content={"error": "active_top_failed", "detail": str(e)}
+        )
 
 # ----- Tasks: ingest / forecast -----
 @app.post("/tasks/discover")
