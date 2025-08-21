@@ -1,0 +1,15 @@
+# python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# node
+web/.next/
+web/node_modules/
+
+# env/secrets
+backend/.env
+web/.env.local
+
+# misc
+.DS_Store

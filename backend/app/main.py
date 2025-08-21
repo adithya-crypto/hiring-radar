@@ -1,0 +1,273 @@
+from datetime import datetime
+import traceback
+from typing import Optional, List, Dict, Any
+
+from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from fastapi.responses import JSONResponse
+from .jobs.run_discovery import run_discovery_now
+
+
+
+from .config import settings
+from .db import SessionLocal
+from . import crud
+from .forecast import forecast_month
+from .models import Signal
+from .schemas import ScoreRow  # response model for /active_top
+
+# Optional scheduler (hourly ingest / daily forecast)
+try:
+    from .jobs.scheduler import attach_scheduler
+except Exception:
+    attach_scheduler = None  # ok if not available in local dev
+
+
+# ----- FastAPI app -----
+app = FastAPI(title="Hiring Radar API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS,  # list of origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ----- DB session dependency -----
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ----- Models for request bodies -----
+class CompanyIn(BaseModel):
+    name: str
+    careers_url: str
+    ats_kind: str  # "greenhouse" | "lever" | "ashby" | "smartrecruiters"
+
+
+class SignalIn(BaseModel):
+    company_id: int
+    kind: str  # "hn_whos_hiring" | "layoff" | "funding" | "earnings"
+    happened_at: datetime
+    payload_json: Optional[Dict[str, Any]] = None
+
+
+# ----- Health -----
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/health/db")
+def health_db(db: Session = Depends(get_db)):
+    db.execute(text("select 1"))
+    return {"ok": True}
+
+
+# ----- Companies -----
+@app.get("/companies")
+def list_companies(db: Session = Depends(get_db)):
+    return crud.list_companies(db)
+
+
+@app.get("/companies/{company_id}")
+def company_detail(company_id: int, db: Session = Depends(get_db)):
+    obj = crud.company_detail(db, company_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="company_not_found")
+    return obj
+
+
+@app.post("/companies")
+def add_company(payload: CompanyIn, db: Session = Depends(get_db)):
+    from .models import Company
+
+    exists = db.query(Company).filter(Company.name == payload.name).first()
+    if exists:
+        return {"ok": True, "id": exists.id, "note": "already_exists"}
+    c = Company(
+        name=payload.name.strip(),
+        careers_url=payload.careers_url.strip(),
+        ats_kind=payload.ats_kind.strip().lower(),
+    )
+    db.add(c)
+    db.commit()
+    db.refresh(c)
+    return {"ok": True, "id": c.id}
+
+
+@app.get("/companies/{company_id}/postings")
+def company_postings(
+    company_id: int,
+    role_family: str = "SDE",
+    since_hours: Optional[int] = None,
+    since_days: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    # Verify company exists (helpful 404)
+    obj = crud.company_detail(db, company_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="company_not_found")
+
+    return crud.list_company_postings(
+        db,
+        company_id=company_id,
+        role_family=role_family,
+        since_hours=since_hours,
+        since_days=since_days,
+    )
+
+
+# ----- Signals (manual input for now) -----
+@app.post("/signals")
+def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
+    s = Signal(
+        company_id=payload.company_id,
+        kind=payload.kind,
+        happened_at=payload.happened_at,
+        payload_json=payload.payload_json,
+    )
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return {"ok": True, "id": s.id}
+
+
+# ----- Scores / Active -----
+@app.get("/scores")
+def scores(role_family: str = "SDE", db: Session = Depends(get_db)):
+    return crud.list_scores(db, role_family)
+
+
+@app.get("/active")
+def active(
+    role_family: str = "SDE", min_score: int = 20, db: Session = Depends(get_db)
+):
+    rows = crud.list_scores(db, role_family)
+    return [r for r in rows if r["score"] >= min_score]
+
+
+@app.get("/active_top")  # <-- remove response_model while we debug
+def active_top(
+    role_family: str = "SDE",
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """Top N companies with at least 1 OPEN posting for the role family, ordered by latest score."""
+    try:
+        data = crud.list_active_top(db, role_family=role_family, limit=limit)
+        # Ensure it's JSON-serializable
+        data = [dict(row) if not isinstance(row, dict) else row for row in data]
+        return JSONResponse(content=data)
+    except Exception as e:
+        import sys, traceback
+
+        tb = traceback.format_exc()
+        print("[/active_top] error:", repr(e), "\n", tb, file=sys.stderr)
+        # Return JSON error so curl/JS can show it
+        return JSONResponse(
+            status_code=500, content={"error": "active_top_failed", "detail": str(e)}
+        )
+
+@app.get("/new_companies")
+def new_companies(days: int = 7, db: Session = Depends(get_db)):
+    try:
+        return crud.list_new_companies(db, days=days)
+    except Exception as e:
+        print("[/new_companies] error:", repr(e))
+        return {"error": "new_companies_failed", "detail": str(e)}
+
+@app.get("/active_top_new")
+def active_top_new(
+    role_family: str = "SDE",
+    days: int = Query(7, ge=1, le=90),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """Top N 'new' companies in the last {days} days, by latest score (with open SDE roles)."""
+    try:
+        return crud.list_active_top_new(db, role_family=role_family, days=days, limit=limit)
+    except Exception as e:
+        print("[/active_top_new] error:", repr(e))
+        return {"error": "active_top_new_failed", "detail": str(e)}
+
+# ----- Tasks: ingest / forecast -----
+@app.post("/tasks/discover")
+def run_discover(db: Session = Depends(get_db)):
+    try:
+        disc = run_discovery_now(db)
+        # chain: pull jobs + recompute scores
+        try:
+            from .jobs.run_ingest import run_ingest_now
+            ing = run_ingest_now(db)
+        except Exception as e:
+            ing = {"error": f"ingest_failed: {e}"}
+        try:
+            from .jobs.run_forecast import run_forecast_now
+            fc = {"forecasted": run_forecast_now(db)}
+        except Exception as e:
+            fc = {"error": f"forecast_failed: {e}"}
+        return {"discover": disc, "ingest": ing, "forecast": fc}
+    except Exception as e:
+        return {"error": "discover_failed", "detail": str(e)}
+
+@app.post("/tasks/ingest")
+def run_ingest(db: Session = Depends(get_db)):
+    try:
+        from .jobs.run_ingest import run_ingest_now
+
+        result = run_ingest_now(db)  # dict: {company_name: count, _total: n}
+        return result
+    except Exception as e:
+        print("[/tasks/ingest] error:", repr(e))
+        return {"error": "ingest_failed", "detail": str(e)}
+
+
+@app.post("/tasks/forecast")
+def run_forecast(db: Session = Depends(get_db)):
+    try:
+        from .jobs.run_forecast import run_forecast_now
+
+        n = run_forecast_now(db)
+        return {"forecasted": n}
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("[/tasks/forecast] error:", repr(e), "\n", tb)
+        return {"error": "forecast_failed", "detail": str(e)}
+
+
+# ----- Forecast (per company) -----
+@app.get("/forecast/{company_id}")
+def forecast_company(company_id: int, db: Session = Depends(get_db)):
+    return forecast_month(db, company_id)
+
+
+# ----- Debug: latest raw payload sample -----
+@app.get("/debug/raw/{company_id}")
+def latest_raw(company_id: int, db: Session = Depends(get_db)):
+    from .models import JobRaw
+
+    row = (
+        db.query(JobRaw)
+        .filter_by(company_id=company_id)
+        .order_by(JobRaw.id.desc())
+        .first()
+    )
+    return {"ok": True, "payload": row.payload_json if row else []}
+
+
+# ----- Attach scheduler (optional) -----
+if attach_scheduler is not None:
+    try:
+        attach_scheduler(app)
+    except Exception as e:
+        print("[scheduler] attach failed:", repr(e))

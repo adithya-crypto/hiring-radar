@@ -1,0 +1,49 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global Font */
+html, body {
+  @apply bg-gray-50 text-gray-900 font-sans antialiased;
+}
+
+/* Headings */
+h1, h2, h3, h4 {
+  @apply font-bold text-gray-800 tracking-tight;
+}
+
+/* Buttons */
+button {
+  @apply px-4 py-2 rounded-2xl font-medium transition-all duration-200;
+}
+button:hover {
+  @apply shadow-md scale-105;
+}
+
+/* Cards */
+.card {
+  @apply bg-white rounded-2xl shadow-sm p-6 transition-all;
+}
+.card:hover {
+  @apply shadow-md scale-[1.01];
+}
+
+/* Tables */
+table {
+  @apply w-full border-collapse text-sm;
+}
+thead {
+  @apply bg-gray-100 text-gray-700 uppercase;
+}
+td, th {
+  @apply px-4 py-3 border-b border-gray-200;
+}
+
+/* Animations */
+.fade-in {
+  animation: fadeIn 0.4s ease-in-out;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
