@@ -9,18 +9,27 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
-from app.db import get_db  # shared DB dependency
+# from app.db import get_db  # <-- REMOVE this
 from .config import settings
 from . import crud
 from .forecast import forecast_month
 from .models import Signal
 from .jobs.run_discovery import run_discovery_now
+from .db import SessionLocal  # <-- use this to define get_db locally
+
+# ---------- DB session dependency ----------
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # Optional scheduler (hourly ingest / daily forecast)
 try:
     from .jobs.scheduler import attach_scheduler
 except Exception:
-    attach_scheduler = None  # fine for local/dev
+    attach_scheduler = None
 
 # -----------------------------
 # FastAPI app
@@ -129,17 +138,12 @@ def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
 
 # -----------------------------
 # Scores / Active (from job_metrics)
-# Robust handling of role_family and week
 # -----------------------------
 FAMILY_FILTER = "lower(jm.role_family) IN ('swe','software','sde')"
 LATEST_WEEK_SQL = "(SELECT date_trunc('week', MAX(week_start)) FROM job_metrics)"
 
 @app.get("/scores")
 def scores(db: Session = Depends(get_db), limit: int = 50):
-    """
-    Latest-week metrics from job_metrics. Robust to 'swe'/'software'/'sde' labels.
-    Always returns JSON (even on error).
-    """
     try:
         sql = text(f"""
             SELECT
@@ -162,10 +166,6 @@ def scores(db: Session = Depends(get_db), limit: int = 50):
 
 @app.get("/active_top")
 def active_top(db: Session = Depends(get_db), limit: int = Query(50, ge=1, le=200)):
-    """
-    Top companies by new SWE postings for the latest week with data.
-    Robust to role_family label differences and always returns JSON.
-    """
     try:
         sql = text(f"""
             SELECT
@@ -187,7 +187,7 @@ def active_top(db: Session = Depends(get_db), limit: int = Query(50, ge=1, le=20
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": "active_top_failed", "detail": str(e)})
 
-# Legacy/aux flows (left as-is, still useful)
+# Legacy
 @app.get("/active")
 def active(role_family: str = "SDE", min_score: int = 20, db: Session = Depends(get_db)):
     rows = crud.list_scores(db, role_family)
@@ -219,7 +219,6 @@ def active_top_new(
 def run_discover(db: Session = Depends(get_db)):
     try:
         disc = run_discovery_now(db)
-        # optionally chain ingest + forecast
         try:
             from .jobs.run_ingest import run_ingest_now
             ing = run_ingest_now(db)
