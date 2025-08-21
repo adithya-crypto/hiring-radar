@@ -1,3 +1,4 @@
+# backend/app/main.py
 from datetime import datetime
 import traceback
 from typing import Optional, List, Dict, Any
@@ -9,36 +10,31 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from fastapi.responses import JSONResponse
 
-from .jobs.run_discovery import run_discovery_now
-# REMOVED: from app.db import get_db  # we define a local get_db below
-
 from .config import settings
-from .db import SessionLocal  # used by local get_db
+from .db import SessionLocal
 from . import crud
 from .forecast import forecast_month
 from .models import Signal
-from .schemas import ScoreRow  # response model for /active_top (kept for reference)
 
-# Optional scheduler (hourly ingest / daily forecast)
+# Optional tasks
+from .jobs.run_discovery import run_discovery_now
 try:
     from .jobs.scheduler import attach_scheduler
 except Exception:
-    attach_scheduler = None  # ok if not available in local dev
-
+    attach_scheduler = None
 
 # ----- FastAPI app -----
 app = FastAPI(title="Hiring Radar API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,  # list of origins
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ----- DB session dependency (local) -----
+# ----- DB session dependency (local; do NOT import from app.db on Render) -----
 def get_db():
     db = SessionLocal()
     try:
@@ -46,13 +42,11 @@ def get_db():
     finally:
         db.close()
 
-
 # ----- Models for request bodies -----
 class CompanyIn(BaseModel):
     name: str
     careers_url: str
     ats_kind: str  # "greenhouse" | "lever" | "ashby" | "smartrecruiters"
-
 
 class SignalIn(BaseModel):
     company_id: int
@@ -60,24 +54,20 @@ class SignalIn(BaseModel):
     happened_at: datetime
     payload_json: Optional[Dict[str, Any]] = None
 
-
 # ----- Health -----
 @app.get("/health")
 def health():
     return {"ok": True}
-
 
 @app.get("/health/db")
 def health_db(db: Session = Depends(get_db)):
     db.execute(text("select 1"))
     return {"ok": True}
 
-
 # ----- Companies -----
 @app.get("/companies")
 def list_companies(db: Session = Depends(get_db)):
     return crud.list_companies(db)
-
 
 @app.get("/companies/{company_id}")
 def company_detail(company_id: int, db: Session = Depends(get_db)):
@@ -86,11 +76,9 @@ def company_detail(company_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="company_not_found")
     return obj
 
-
 @app.post("/companies")
 def add_company(payload: CompanyIn, db: Session = Depends(get_db)):
     from .models import Company
-
     exists = db.query(Company).filter(Company.name == payload.name).first()
     if exists:
         return {"ok": True, "id": exists.id, "note": "already_exists"}
@@ -104,7 +92,6 @@ def add_company(payload: CompanyIn, db: Session = Depends(get_db)):
     db.refresh(c)
     return {"ok": True, "id": c.id}
 
-
 @app.get("/companies/{company_id}/postings")
 def company_postings(
     company_id: int,
@@ -113,11 +100,9 @@ def company_postings(
     since_days: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
-    # Verify company exists (helpful 404)
     obj = crud.company_detail(db, company_id)
     if not obj:
         raise HTTPException(status_code=404, detail="company_not_found")
-
     return crud.list_company_postings(
         db,
         company_id=company_id,
@@ -126,8 +111,7 @@ def company_postings(
         since_days=since_days,
     )
 
-
-# ----- Signals (manual input for now) -----
+# ----- Signals -----
 @app.post("/signals")
 def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
     s = Signal(
@@ -141,44 +125,42 @@ def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
     db.refresh(s)
     return {"ok": True, "id": s.id}
 
-
-# ----- Scores / Active (materialized off job_metrics) -----
+# ----- Scores / Active (original: from hiring_score) -----
 @app.get("/scores")
-def scores(db: Session = Depends(get_db), family: str = "swe", limit: int = 50):
-    """
-    Current-week scores from job_metrics.
-    Prefer 'swe' rows; fall back to 'software' to avoid duplicates.
-    """
-    sql = text("""
-        WITH picked AS (
-          SELECT
-            jm.company_id,
-            c.name AS company_name,
-            jm.sde_openings,
-            jm.sde_new,
-            jm.sde_closed,
-            CASE WHEN jm.role_family = 'swe' THEN 0 ELSE 1 END AS fam_rank
-          FROM job_metrics jm
-          JOIN companies c ON c.id = jm.company_id
-          WHERE jm.week_start = date_trunc('week', now())
-            AND jm.role_family IN (:family, 'software')
-        ),
-        ranked AS (
-          SELECT
-            *,
-            ROW_NUMBER() OVER (PARTITION BY company_id ORDER BY fam_rank) AS rn
-          FROM picked
-        )
-        SELECT company_id, company_name, sde_openings, sde_new, sde_closed
-        FROM ranked
-        WHERE rn = 1
-        ORDER BY sde_openings DESC, sde_new DESC, company_name
-        LIMIT :limit
-    """)
-    rows = db.execute(sql, {"family": family, "limit": limit}).mappings().all()
-    return [dict(r) for r in rows]
+def scores(db: Session = Depends(get_db), role_family: str = "SDE", limit: int = 50):
+    """Latest scores per company for role_family from hiring_score."""
+    return crud.list_scores(db, role_family=role_family, limit=limit)
 
+@app.get("/active")
+def active(
+    role_family: str = "SDE",
+    min_score: int = 20,
+    db: Session = Depends(get_db),
+):
+    rows = crud.list_scores(db, role_family=role_family)
+    return [r for r in rows if r.get("score", 0) >= min_score]
 
+@app.get("/active_top")
+def active_top(
+    role_family: str = "SDE",
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """Top companies by latest score (requires hiring_score to be populated)."""
+    try:
+        return crud.list_active_top(db, role_family=role_family, limit=limit)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("[/active_top] error:", repr(e), "\n", tb)
+        return JSONResponse(status_code=500, content={"error": "active_top_failed", "detail": str(e)})
+
+@app.get("/new_companies")
+def new_companies(days: int = 7, db: Session = Depends(get_db)):
+    try:
+        return crud.list_new_companies(db, days=days)
+    except Exception as e:
+        print("[/new_companies] error:", repr(e))
+        return {"error": "new_companies_failed", "detail": str(e)}
 
 @app.get("/active_top_new")
 def active_top_new(
@@ -187,66 +169,18 @@ def active_top_new(
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    """Top N 'new' companies in the last {days} days, by latest score (with open SDE roles)."""
+    """Top N 'new' companies in the last {days} days by latest score."""
     try:
         return crud.list_active_top_new(db, role_family=role_family, days=days, limit=limit)
     except Exception as e:
         print("[/active_top_new] error:", repr(e))
         return {"error": "active_top_new_failed", "detail": str(e)}
 
-@app.get("/active_top")
-def active_top(
-    family: str = "swe",
-    limit: int = Query(50, ge=1, le=200),
-    db: Session = Depends(get_db),
-):
-    """
-    Top N companies for the current week by new SWE postings.
-    Prefer 'swe' rows; fall back to 'software' to avoid duplicates.
-    """
-    try:
-        sql = text("""
-            WITH picked AS (
-              SELECT
-                jm.company_id,
-                c.name AS company_name,
-                jm.sde_new,
-                jm.sde_openings,
-                jm.sde_closed,
-                CASE WHEN jm.role_family = 'swe' THEN 0 ELSE 1 END AS fam_rank
-              FROM job_metrics jm
-              JOIN companies c ON c.id = jm.company_id
-              WHERE jm.week_start = date_trunc('week', now())
-                AND jm.role_family IN (:family, 'software')
-                AND (jm.sde_openings > 0 OR jm.sde_new > 0)
-            ),
-            ranked AS (
-              SELECT
-                *,
-                ROW_NUMBER() OVER (PARTITION BY company_id ORDER BY fam_rank) AS rn
-              FROM picked
-            )
-            SELECT company_id, company_name, sde_new, sde_openings, sde_closed
-            FROM ranked
-            WHERE rn = 1
-            ORDER BY sde_new DESC, sde_openings DESC, company_name
-            LIMIT :limit
-        """)
-        rows = db.execute(sql, {"family": family, "limit": limit}).mappings().all()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        tb = traceback.format_exc()
-        print("[/active_top] error:", repr(e), "\n", tb)
-        return JSONResponse(
-            status_code=500, content={"error": "active_top_failed", "detail": str(e)}
-        )
-
-# ----- Tasks: ingest / forecast -----
+# ----- Tasks: discover / ingest / forecast -----
 @app.post("/tasks/discover")
 def run_discover(db: Session = Depends(get_db)):
     try:
         disc = run_discovery_now(db)
-        # chain: pull jobs + recompute scores
         try:
             from .jobs.run_ingest import run_ingest_now
             ing = run_ingest_now(db)
@@ -261,17 +195,13 @@ def run_discover(db: Session = Depends(get_db)):
     except Exception as e:
         return {"error": "discover_failed", "detail": str(e)}
 
-
 @app.post("/tasks/ingest")
 def run_ingest(db: Session = Depends(get_db)):
     try:
         from .jobs.run_ingest import run_ingest_now
-        result = run_ingest_now(db)  # dict: {company_name: count, _total: n}
-        return result
+        return run_ingest_now(db)
     except Exception as e:
-        print("[/tasks/ingest] error:", repr(e))
         return {"error": "ingest_failed", "detail": str(e)}
-
 
 @app.post("/tasks/forecast")
 def run_forecast(db: Session = Depends(get_db)):
@@ -284,12 +214,10 @@ def run_forecast(db: Session = Depends(get_db)):
         print("[/tasks/forecast] error:", repr(e), "\n", tb)
         return {"error": "forecast_failed", "detail": str(e)}
 
-
 # ----- Forecast (per company) -----
 @app.get("/forecast/{company_id}")
 def forecast_company(company_id: int, db: Session = Depends(get_db)):
     return forecast_month(db, company_id)
-
 
 # ----- Debug: latest raw payload sample -----
 @app.get("/debug/raw/{company_id}")
@@ -302,7 +230,6 @@ def latest_raw(company_id: int, db: Session = Depends(get_db)):
         .first()
     )
     return {"ok": True, "payload": row.payload_json if row else []}
-
 
 # ----- Attach scheduler (optional) -----
 if attach_scheduler is not None:
