@@ -9,13 +9,12 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
-# from app.db import get_db  # <-- REMOVE this
 from .config import settings
 from . import crud
 from .forecast import forecast_month
 from .models import Signal
 from .jobs.run_discovery import run_discovery_now
-from .db import SessionLocal  # <-- use this to define get_db locally
+from .db import SessionLocal  # used to define local get_db
 
 # ---------- DB session dependency ----------
 def get_db():
@@ -137,18 +136,22 @@ def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
     return {"ok": True, "id": s.id}
 
 # -----------------------------
-# Scores / Active (from job_metrics)
+# Scores / Active
 # -----------------------------
-FAMILY_FILTER = "lower(jm.role_family) IN ('swe','software','sde')"
-LATEST_WEEK_SQL = "(SELECT date_trunc('week', MAX(week_start)) FROM job_metrics)"
-
-# ----- Scores / Active – original "hiring_score" materialized view -----
+# Weighted score so "Score (New)" != "New (28d)"
+def compute_activity_score(sde_new: int, sde_openings: int) -> int:
+    # Emphasize recent activity, cap openings influence so whales don't dominate
+    return 3 * int(sde_new or 0) + min(int(sde_openings or 0), 50)
 
 @app.get("/scores")
-def scores(db: Session = Depends(get_db), role_family: str = "software", limit: int = 50):
+def scores(
+    db: Session = Depends(get_db),
+    role_family: str = "software",
+    limit: int = 50
+):
     """
-    Return top companies by 'hiring_score' (materialized from job_postings).
-    Defaults to role_family='software' which covers SWE/SDE roles.
+    Original-style materialized rows from hiring_score.
+    Returns array shaped for the frontend table.
     """
     sql = text("""
         SELECT
@@ -168,7 +171,7 @@ def scores(db: Session = Depends(get_db), role_family: str = "software", limit: 
         "rf3": "sde",
         "limit": limit
     }).mappings().all()
-    # Shape similar to your original UI expectations
+
     out = []
     for r in rows:
         dj = r["details_json"] or {}
@@ -176,13 +179,12 @@ def scores(db: Session = Depends(get_db), role_family: str = "software", limit: 
             "company_id":   r["company_id"],
             "company_name": r["company_name"],
             "role_family":  role_family,
-            "score":        r["score"],
+            "score":        int(r["score"] or 0),
             "details_json": dj,
             "evidence_urls": (dj.get("evidence_urls") or []),
             "open_count":    dj.get("open_now"),
         })
     return out
-
 
 @app.get("/active_top")
 def active_top(
@@ -191,8 +193,8 @@ def active_top(
     db: Session = Depends(get_db),
 ):
     """
-    Top companies for the current week by SWE activity (materialized in job_metrics).
-    Returns UI-friendly fields: score, open_count, details_json.new_last_4w, etc.
+    Top companies for the current week by SWE activity (job_metrics).
+    Returns UI-friendly fields: score (weighted), open_count, details_json.new_last_4w.
     """
     try:
         sql = text("""
@@ -212,19 +214,21 @@ def active_top(
         """)
         rows = db.execute(sql, {"family": family, "limit": limit}).mappings().all()
 
-        # Shape for the frontend table
         out = []
         for r in rows:
+            sde_new = int(r["sde_new"] or 0)
+            sde_open = int(r["sde_openings"] or 0)
+            score = compute_activity_score(sde_new, sde_open)
             out.append({
                 "company_id": r["company_id"],
                 "company_name": r["company_name"],
-                "sde_openings": r["sde_openings"],
-                "sde_new": r["sde_new"],
-                "sde_closed": r["sde_closed"],
+                "sde_openings": sde_open,
+                "sde_new": sde_new,
+                "sde_closed": int(r["sde_closed"] or 0),
                 # UI fields:
-                "score": int(r["sde_new"] or 0),          # primary sort/Score column
-                "open_count": int(r["sde_openings"] or 0),
-                "details_json": {"new_last_4w": int(r["sde_new"] or 0)},
+                "score": score,
+                "open_count": sde_open,
+                "details_json": {"new_last_4w": sde_new, "score_formula": "3*new + min(open,50)"},
                 "evidence_urls": [],
             })
         return out
@@ -235,8 +239,7 @@ def active_top(
             status_code=500, content={"error": "active_top_failed", "detail": str(e)}
         )
 
-
-# Legacy
+# Legacy (kept)
 @app.get("/active")
 def active(role_family: str = "SDE", min_score: int = 20, db: Session = Depends(get_db)):
     rows = crud.list_scores(db, role_family)
@@ -259,9 +262,8 @@ def active_top_new(
     """
     Top 'new' companies created in the last {days} days.
     - Counts SWE/SDE postings per company
-    - score := number of postings updated/created within last {days}
-    - open_count := total SWE/SDE postings (no closed_at column in schema, so we treat all rows as open)
-    - shapes details_json.e.g. {"window_days": days, "new_last_4w": score}
+    - score := weighted score: 3*sde_new + min(sde_openings, 50)
+    - open_count := total SWE/SDE postings (schema has no closed_at, so treat all as open)
     """
     try:
         sql = text("""
@@ -298,25 +300,25 @@ def active_top_new(
 
         out = []
         for r in rows:
-            score = int(r["sde_new"] or 0)  # main score for "new" view
+            sde_new = int(r["sde_new"] or 0)
+            sde_open = int(r["sde_openings"] or 0)
+            score = compute_activity_score(sde_new, sde_open)
             out.append({
                 "company_id": r["company_id"],
                 "company_name": r["company_name"],
-                "sde_openings": int(r["sde_openings"] or 0),
-                "sde_new": score,
+                "sde_openings": sde_open,
+                "sde_new": sde_new,
                 "sde_closed": 0,
                 # UI fields:
                 "score": score,
-                "open_count": int(r["sde_openings"] or 0),
-                "details_json": {"window_days": days, "new_last_4w": score},
+                "open_count": sde_open,
+                "details_json": {"window_days": days, "new_last_4w": sde_new, "score_formula": "3*new + min(open,50)"},
                 "evidence_urls": [],
             })
         return out
     except Exception as e:
         print("[/active_top_new] error:", repr(e))
         return {"error": "active_top_new_failed", "detail": str(e)}
-
-
 
 # -----------------------------
 # Tasks: discover / ingest / forecast
@@ -325,6 +327,7 @@ def active_top_new(
 def run_discover(db: Session = Depends(get_db)):
     try:
         disc = run_discovery_now(db)
+        # Chain ingest + forecast
         try:
             from .jobs.run_ingest import run_ingest_now
             ing = run_ingest_now(db)
