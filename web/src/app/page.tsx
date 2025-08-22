@@ -13,20 +13,24 @@ const API =
       ? 'https://hiring-radar-api.onrender.com'
       : 'http://localhost:8000')
 
+/* ---------------- Types (normalized) ---------------- */
 type MetricsRow = {
   company_id: number
   company_name: string
-  sde_openings: number
-  sde_new: number
-  sde_closed: number
+  sde_openings?: number | null
+  sde_new?: number | null
+  sde_closed?: number | null
+  score?: number | null
+  details_json?: { new_last_4w?: number; open_now?: number } | null
+  open_count?: number | null
 }
 
 type UiRow = {
   company_id: number
   company_name: string
-  score: number        // we define as sde_new (new postings this week)
-  open_now: number     // sde_openings
-  new_28d: number      // sde_new
+  score: number        // main score we display (prefer “new”)
+  open_now: number     // open SDE count
+  new_28d: number      // last-28-day new count (if known)
 }
 
 type Company = { id: number; name: string; ticker?: string | null }
@@ -45,7 +49,7 @@ type Posting = {
 type TimeFilter = 'all' | '24h' | '48h' | '72h' | '7d' | '14d' | '30d'
 type ViewMode = 'top' | 'new'
 
-// --- US location detection helpers (unchanged) ---
+/* ---------------- Helpers ---------------- */
 const STATE_ABBRS = new Set([
   'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN',
   'MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA',
@@ -74,6 +78,53 @@ function isUS(loc?: string | null): boolean {
   return false
 }
 
+/** Safely unwrap API JSON that might be: array, {ok:true}[], {items:[...]}, or {error:...} */
+async function getJson(url: string) {
+  const r = await fetch(url, { cache: 'no-store' })
+  const raw = await r.json().catch(() => null)
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+
+  // If backend sometimes returns `{ ok: true }[...]` (invalid JSON envelope the curl showed was
+  // two separate JSON payloads). In fetch, you'll only get the last JSON. Handle common shapes:
+  if (Array.isArray(raw)) return raw
+  if (!raw) return []
+  if (raw.error) throw new Error(raw.detail || raw.error)
+  if (Array.isArray(raw.items)) return raw.items
+  if (Array.isArray(raw.data)) return raw.data
+  // Some endpoints just return a dict of company -> count; that's not what we need here.
+  // Fall back to empty if it doesn't look like our rows.
+  return raw
+}
+
+/** Normalize one mixed row into UiRow */
+function toUiRow(m: MetricsRow): UiRow {
+  // Prefer a “new last 4w” metric when provided by backend
+  const new28 =
+    (m.details_json?.new_last_4w ?? null) ??
+    (m.sde_new ?? null) ??
+    (m.score ?? 0)
+
+  // “open_now” can come from sde_openings or details_json.open_now or open_count
+  const open =
+    (m.sde_openings ?? null) ??
+    (m.details_json?.open_now ?? null) ??
+    (m.open_count ?? 0)
+
+  // “score” in the table = the near-term activity signal.
+  const score =
+    (m.sde_new ?? null) ??
+    (m.details_json?.new_last_4w ?? null) ??
+    (m.score ?? 0)
+
+  return {
+    company_id: m.company_id,
+    company_name: m.company_name,
+    score: Number(score || 0),
+    open_now: Number(open || 0),
+    new_28d: Number(new28 || 0),
+  }
+}
+
 export default function Page() {
   const [rows, setRows] = useState<UiRow[]>([])
   const [companies, setCompanies] = useState<Record<number, Company>>({})
@@ -95,7 +146,7 @@ export default function Page() {
   const [panelPostings, setPanelPostings] = useState<Posting[]>([])
   const [usOnly, setUsOnly] = useState<boolean>(true)
 
-  // --- Debounce search for smoother UX ---
+  // Debounce
   useEffect(() => {
     const t = setTimeout(() => setDebouncedQuery(companyQuery.trim().toLowerCase()), 200)
     return () => clearTimeout(t)
@@ -106,56 +157,65 @@ export default function Page() {
     [panelCompanyId, companies]
   )
 
-  // Normalize API rows -> UI rows
-  const normalize = (arr: MetricsRow[]): UiRow[] =>
-    arr.map(r => ({
-      company_id: r.company_id,
-      company_name: r.company_name,
-      score: r.sde_new,          // define “score” = new postings this week
-      open_now: r.sde_openings,  // total open SDE
-      new_28d: r.sde_new,        // expose as column too
-    }))
+  // Load companies once so we can show names even if some APIs omit them
+  async function loadCompanies() {
+    try {
+      const res = await getJson(`${API}/companies`)
+      if (Array.isArray(res)) {
+        const cmap: Record<number, Company> = {}
+        res.forEach((c: any) => { if (c?.id) cmap[c.id] = c })
+        setCompanies(cmap)
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Normalize API rows -> UI rows (defensive for non-arrays)
+  function normalizeArray(maybeArr: any): UiRow[] {
+    if (!maybeArr) return []
+    const arr = Array.isArray(maybeArr) ? maybeArr : []
+    return arr
+      .filter(Boolean)
+      .map((r: any) => toUiRow(r))
+  }
 
   async function fetchTop() {
     setBusy(true); setError(null)
     try {
-      const [sRes, cRes] = await Promise.all([
-        // NOTE: backend expects `family`, not role_family
-        fetch(`${API}/active_top?family=swe&limit=50`, { cache: 'no-store' }),
-        fetch(`${API}/companies`, { cache: 'no-store' }),
+      const [scoresJson] = await Promise.all([
+        getJson(`${API}/active_top?family=swe&limit=50`),
+        loadCompanies(),
       ])
-      if (!sRes.ok) throw new Error(`GET /active_top ${sRes.status}`)
-      if (!cRes.ok) throw new Error(`GET /companies ${cRes.status}`)
-      const [scoresJson, companiesJson] = await Promise.all([sRes.json(), cRes.json()])
-      const cmap: Record<number, Company> = {}
-      ;(companiesJson as Company[]).forEach((c) => (cmap[c.id] = c))
-      setCompanies(cmap)
-      const ui = normalize(scoresJson as MetricsRow[])
+      const ui = normalizeArray(scoresJson)
+      // If backend did not include names, hydrate from companies map (after a tick)
       setRows(ui.sort((a, b) => (b.score - a.score) || (b.open_now - a.open_now)))
     } catch (e: any) {
       setError(e?.message || 'Failed to load data')
+      setRows([])
     } finally { setBusy(false); setLoading(false) }
   }
 
   async function fetchTopNew(days = 7) {
     setBusy(true); setError(null)
     try {
-      const [sRes, cRes] = await Promise.all([
-        // If your /active_top_new returns older shape, you can switch this to /scores or keep /active_top.
-        fetch(`${API}/active_top_new?role_family=SDE&days=${days}&limit=50`, { cache: 'no-store' }),
-        fetch(`${API}/companies`, { cache: 'no-store' }),
-      ])
-      if (!sRes.ok) throw new Error(`GET /active_top_new ${sRes.status}`)
-      if (!cRes.ok) throw new Error(`GET /companies ${cRes.status}`)
-      const [scoresJson, companiesJson] = await Promise.all([sRes.json(), cRes.json()])
-      const cmap: Record<number, Company> = {}
-      ;(companiesJson as Company[]).forEach((c) => (cmap[c.id] = c))
-      setCompanies(cmap)
-      // Attempt to normalize; if your /active_top_new uses same fields, this works.
-      const ui = normalize(scoresJson as MetricsRow[])
+      // Try the dedicated endpoint first
+      let payload = await getJson(`${API}/active_top_new?role_family=SDE&days=${days}&limit=50`)
+      // If the endpoint returns a non-array (some JSON envelope), coerce to array if possible
+      if (!Array.isArray(payload)) {
+        // Fallback to /scores (original scorer)
+        payload = await getJson(`${API}/scores?limit=50`)
+      }
+      const ui = normalizeArray(payload)
       setRows(ui.sort((a, b) => (b.score - a.score) || (b.open_now - a.open_now)))
     } catch (e: any) {
-      setError(e?.message || 'Failed to load data')
+      // Final fallback: use /scores if /active_top_new failed
+      try {
+        const payload = await getJson(`${API}/scores?limit=50`)
+        const ui = normalizeArray(payload)
+        setRows(ui.sort((a, b) => (b.score - a.score) || (b.open_now - a.open_now)))
+      } catch (ee: any) {
+        setError(e?.message || ee?.message || 'Failed to load new companies')
+        setRows([])
+      }
     } finally { setBusy(false); setLoading(false) }
   }
 
@@ -179,7 +239,7 @@ export default function Page() {
     setPanelLoading(true)
     try {
       const url = new URL(`${API}/companies/${companyId}/postings`)
-      url.searchParams.set('role_family', 'SDE') // backend accepts this in CRUD
+      url.searchParams.set('role_family', 'SDE')
       switch (tf) {
         case '24h': url.searchParams.set('since_hours', '24'); break
         case '48h': url.searchParams.set('since_hours', '48'); break
@@ -190,10 +250,9 @@ export default function Page() {
         case 'all':
         default: break
       }
-      const r = await fetch(url.toString(), { cache: 'no-store' })
-      if (!r.ok) throw new Error(`GET /companies/${companyId}/postings ${r.status}`)
-      const data = (await r.json()) as Posting[]
-      setPanelPostings(data)
+      const data = await getJson(url.toString())
+      const arr = Array.isArray(data) ? (data as Posting[]) : []
+      setPanelPostings(arr)
     } catch {
       setPanelPostings([])
     } finally { setPanelLoading(false) }
