@@ -186,39 +186,54 @@ def scores(db: Session = Depends(get_db), role_family: str = "software", limit: 
 
 @app.get("/active_top")
 def active_top(
-    role_family: str = "software",
+    family: str = "swe",
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
     """
-    Top companies by hiring_score (original logic).
+    Top companies for the current week by SWE activity (materialized in job_metrics).
+    Returns UI-friendly fields: score, open_count, details_json.new_last_4w, etc.
     """
     try:
         sql = text("""
             SELECT
               c.id   AS company_id,
               c.name AS company_name,
-              hs.score,
-              (hs.details_json->>'open_now')::int   AS sde_openings,
-              (hs.details_json->>'new_last_4w')::int AS sde_new,
-              0::int AS sde_closed
-            FROM hiring_score hs
-            JOIN companies c ON c.id = hs.company_id
-            WHERE lower(hs.role_family) IN (:rf1, :rf2, :rf3)
-            ORDER BY hs.score DESC, c.name
+              jm.sde_new,
+              jm.sde_openings,
+              jm.sde_closed
+            FROM job_metrics jm
+            JOIN companies c ON c.id = jm.company_id
+            WHERE jm.week_start = date_trunc('week', now())
+              AND jm.role_family IN (:family, 'software')
+              AND (jm.sde_openings > 0 OR jm.sde_new > 0)
+            ORDER BY jm.sde_new DESC, jm.sde_openings DESC, c.name
             LIMIT :limit
         """)
-        rows = db.execute(sql, {
-            "rf1": role_family.lower(),
-            "rf2": "swe",
-            "rf3": "sde",
-            "limit": limit
-        }).mappings().all()
-        return [dict(r) for r in rows]
+        rows = db.execute(sql, {"family": family, "limit": limit}).mappings().all()
+
+        # Shape for the frontend table
+        out = []
+        for r in rows:
+            out.append({
+                "company_id": r["company_id"],
+                "company_name": r["company_name"],
+                "sde_openings": r["sde_openings"],
+                "sde_new": r["sde_new"],
+                "sde_closed": r["sde_closed"],
+                # UI fields:
+                "score": int(r["sde_new"] or 0),          # primary sort/Score column
+                "open_count": int(r["sde_openings"] or 0),
+                "details_json": {"new_last_4w": int(r["sde_new"] or 0)},
+                "evidence_urls": [],
+            })
+        return out
     except Exception as e:
-        from fastapi.responses import JSONResponse
-        import traceback
-        return JSONResponse(status_code=500, content={"error": "active_top_failed", "detail": str(e), "tb": traceback.format_exc()})
+        tb = traceback.format_exc()
+        print("[/active_top] error:", repr(e), "\n", tb)
+        return JSONResponse(
+            status_code=500, content={"error": "active_top_failed", "detail": str(e)}
+        )
 
 
 # Legacy
@@ -236,66 +251,71 @@ def new_companies(days: int = 7, db: Session = Depends(get_db)):
 
 @app.get("/active_top_new")
 def active_top_new(
+    role_family: str = "SDE",
     days: int = Query(7, ge=1, le=90),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
     """
-    Top 'new' companies (created recently) ordered by latest SWE/SDE postings.
-    If companies.created_at doesn't exist, we fall back to companies that had
-    any SWE/SDE posting updated/created in the last {days}.
+    Top 'new' companies created in the last {days} days.
+    - Counts SWE/SDE postings per company
+    - score := number of postings updated/created within last {days}
+    - open_count := total SWE/SDE postings (no closed_at column in schema, so we treat all rows as open)
+    - shapes details_json.e.g. {"window_days": days, "new_last_4w": score}
     """
     try:
-        # First try: use companies.created_at if present
-        sql1 = text(f"""
+        sql = text("""
             SELECT
               c.id   AS company_id,
               c.name AS company_name,
-              COALESCE(SUM(CASE WHEN jp.closed_at IS NULL THEN 1 ELSE 0 END), 0)::int AS sde_openings,
-              COALESCE(SUM(CASE WHEN COALESCE(jp.updated_at, jp.created_at) > now() - INTERVAL '{days} days' THEN 1 ELSE 0 END), 0)::int AS sde_new,
-              0::int AS sde_closed
+              -- total SWE/SDE postings for the company
+              COUNT(jp.id)::int FILTER (
+                WHERE lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+              ) AS sde_openings,
+              -- postings considered "new" in the last :days
+              COUNT(jp.id)::int FILTER (
+                WHERE lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+                  AND COALESCE(jp.updated_at, jp.created_at) > (now() - make_interval(days => :days))
+              ) AS sde_new
             FROM companies c
             LEFT JOIN job_postings jp
               ON jp.company_id = c.id
-             AND lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
-            WHERE c.created_at > now() - INTERVAL '{days} days'
+            WHERE c.created_at > (now() - make_interval(days => :days))
             GROUP BY c.id, c.name
-            HAVING COALESCE(SUM(CASE WHEN COALESCE(jp.updated_at, jp.created_at) > now() - INTERVAL '{days} days' THEN 1 ELSE 0 END), 0) > 0
-               OR COALESCE(SUM(CASE WHEN jp.closed_at IS NULL THEN 1 ELSE 0 END), 0) > 0
+            HAVING
+              COUNT(jp.id) FILTER (
+                WHERE lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+                  AND COALESCE(jp.updated_at, jp.created_at) > (now() - make_interval(days => :days))
+              ) > 0
+              OR
+              COUNT(jp.id) FILTER (
+                WHERE lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+              ) > 0
             ORDER BY sde_new DESC, sde_openings DESC, c.name
             LIMIT :limit
         """)
-        rows = db.execute(sql1, {"limit": limit}).mappings().all()
-        if rows:
-            return [dict(r) for r in rows]
+        rows = db.execute(sql, {"days": days, "limit": limit}).mappings().all()
 
-        # Fallback: if companies.created_at is missing/unused, derive "new" by first postings
-        sql2 = text(f"""
-            WITH recent_companies AS (
-              SELECT DISTINCT jp.company_id
-              FROM job_postings jp
-              WHERE lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
-                AND COALESCE(jp.updated_at, jp.created_at) > now() - INTERVAL '{days} days'
-            )
-            SELECT
-              c.id   AS company_id,
-              c.name AS company_name,
-              COALESCE(SUM(CASE WHEN jp.closed_at IS NULL THEN 1 ELSE 0 END), 0)::int AS sde_openings,
-              COALESCE(SUM(CASE WHEN COALESCE(jp.updated_at, jp.created_at) > now() - INTERVAL '{days} days' THEN 1 ELSE 0 END), 0)::int AS sde_new,
-              0::int AS sde_closed
-            FROM recent_companies rc
-            JOIN companies c ON c.id = rc.company_id
-            LEFT JOIN job_postings jp
-              ON jp.company_id = c.id
-             AND lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
-            GROUP BY c.id, c.name
-            ORDER BY sde_new DESC, sde_openings DESC, c.name
-            LIMIT :limit
-        """)
-        rows = db.execute(sql2, {"limit": limit}).mappings().all()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            score = int(r["sde_new"] or 0)  # main score for "new" view
+            out.append({
+                "company_id": r["company_id"],
+                "company_name": r["company_name"],
+                "sde_openings": int(r["sde_openings"] or 0),
+                "sde_new": score,
+                "sde_closed": 0,
+                # UI fields:
+                "score": score,
+                "open_count": int(r["sde_openings"] or 0),
+                "details_json": {"window_days": days, "new_last_4w": score},
+                "evidence_urls": [],
+            })
+        return out
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": "active_top_new_failed", "detail": str(e)})
+        print("[/active_top_new] error:", repr(e))
+        return {"error": "active_top_new_failed", "detail": str(e)}
+
 
 
 # -----------------------------
