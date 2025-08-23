@@ -11,3 +11,4 @@ tenacity
 pandas
 numpy
 statsmodels
+requests>=2.31.0,<3
