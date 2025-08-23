@@ -2,14 +2,17 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from typing import Optional
+
 from ..db import SessionLocal
 
+# connectors
 from ..connectors.greenhouse import fetch_greenhouse
 from ..connectors.lever import fetch_lever
 from ..connectors.ashby import fetch_ashby
 from ..connectors.smartrecruiters import fetch_smartrecruiters
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+
 
 def upsert_job_posting(db, it: dict):
     db.execute(text("""
@@ -29,23 +32,23 @@ def upsert_job_posting(db, it: dict):
             role_family  = COALESCE(EXCLUDED.role_family, job_postings.role_family)
     """), it)
 
+
 def get_or_create_company_id(db, kind: str, handle: str, display_name: Optional[str]):
     """
-    Robust company upsert keyed by (ats_kind, ats_handle). Also repairs legacy rows
-    that exist by name but have NULL ats_handle.
+    Robust company upsert keyed by (ats_kind, ats_handle).
+    Also repairs legacy rows that exist by name but have NULL ats_handle.
     """
     if not handle or not handle.strip():
         raise ValueError("empty_handle")
 
-    # 1) If exists by (ats_kind, ats_handle), use it
     row = db.execute(text(
         "SELECT id FROM companies WHERE ats_kind=:k AND ats_handle=:h"
     ), {"k": kind, "h": handle}).first()
     if row:
         return row[0]
 
-    # 2) If there's a name-only legacy row, claim it by setting ats_* fields
     name_guess = (display_name or handle).strip()
+
     legacy = db.execute(text("""
         UPDATE companies
         SET ats_kind=:k, ats_handle=:h
@@ -55,8 +58,6 @@ def get_or_create_company_id(db, kind: str, handle: str, display_name: Optional[
     if legacy:
         return legacy[0]
 
-    # 3) Create or get via the unique (ats_kind, ats_handle)
-    #    Keep existing name if present; otherwise set it from name_guess
     row = db.execute(text("""
         INSERT INTO companies(name, ats_kind, ats_handle)
         VALUES (:n, :k, :h)
@@ -65,6 +66,7 @@ def get_or_create_company_id(db, kind: str, handle: str, display_name: Optional[
         RETURNING id
     """), {"n": name_guess, "k": kind, "h": handle}).first()
     return row[0]
+
 
 @router.post("/ingest")
 def run_ingest():
@@ -101,7 +103,6 @@ def run_ingest():
                 totals["skipped"] += 1
                 continue
 
-            # Resolve company id
             try:
                 company_id = get_or_create_company_id(db, kind, handle, s.get("display_name"))
             except Exception as e:
@@ -113,7 +114,7 @@ def run_ingest():
             for it in items:
                 it["company_id"] = company_id
 
-                # Heuristic role family
+                # Heuristic role-family tagging
                 title = (it.get("title") or "").lower()
                 it["role_family"] = "SDE" if any(k in title for k in ["software", "engineer", "developer", "swe", "sde"]) else None
 
@@ -121,7 +122,6 @@ def run_ingest():
                     upsert_job_posting(db, it)
                     local += 1
                 except Exception as e:
-                    # keep going; one bad row shouldn't kill the whole source
                     print("upsert error", {"kind": kind, "handle": handle, "job": it.get("source_job_id")}, e)
 
             if local:
@@ -134,6 +134,7 @@ def run_ingest():
     except Exception as e:
         db.rollback()
         return JSONResponse(status_code=500, content={"ok": False, "error": "ingest_failed", "detail": str(e)})
+
 
 @router.post("/forecast")
 def run_forecast():

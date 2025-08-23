@@ -1,59 +1,95 @@
-import re, requests
-from typing import Optional, Tuple
+import re
+import requests
+from urllib.parse import urlparse
 
-def fetch(url: str, timeout=15) -> Optional[str]:
+from bs4 import BeautifulSoup
+
+UA = "Mozilla/5.0 (compatible; HiringRadarBot/1.0; +https://example.com/bot)"
+
+
+def fetch_url(url: str, timeout: int = 15):
     try:
-        r = requests.get(url, timeout=timeout, allow_redirects=True, headers={
-            "User-Agent": "HiringRadarBot/1.0 (+contact: support@yourdomain)"
-        })
-        if 200 <= r.status_code < 400:
-            return r.text or ""
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
+        if r.status_code >= 400:
+            return None
+        return r.text
+    except Exception:
+        return None
+
+
+def parse_ats_from_url(url: str):
+    """
+    Returns (kind, handle) if URL is a direct ATS board.
+    Supports Greenhouse/Lever/Ashby/SmartRecruiters.
+    """
+    try:
+        u = url.strip()
+        low = u.lower()
+
+        # Greenhouse board
+        m = re.search(r"boards\.greenhouse\.io/([^/?#]+)", low)
+        if m:
+            return "greenhouse", m.group(1)
+
+        # Lever board
+        m = re.search(r"jobs\.lever\.co/([^/?#]+)", low)
+        if m:
+            return "lever", m.group(1)
+
+        # Ashby
+        m = re.search(r"jobs\.ashbyhq\.com/([^/?#]+)", low)
+        if m:
+            return "ashby", m.group(1)
+
+        # SmartRecruiters
+        m = re.search(r"careers\.smartrecruiters\.com/([^/?#]+)", low)
+        if m:
+            return "smartrecruiters", m.group(1)
+
+        return None, None
+    except Exception:
+        return None, None
+
+
+def detect_from_html(html: str):
+    """
+    Scans HTML for links to supported ATS and extracts (kind, handle).
+    """
+    out = []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            k, h = parse_ats_from_url(a["href"])
+            if k and h:
+                item = {"kind": k, "handle": h}
+                if item not in out:
+                    out.append(item)
     except Exception:
         pass
-    return None
+    return out
 
-def detect_from_html(html: str) -> Optional[Tuple[str, str]]:
-    m = re.search(r'boards\.greenhouse\.io/([a-zA-Z0-9\-_/]+)', html)
-    if m:
-        token = m.group(1).split('/')[0]
-        return ("greenhouse", token)
 
-    m = re.search(r'jobs\.lever\.co/([a-zA-Z0-9\-\._/]+)', html)
-    if m:
-        handle = m.group(1).split('/')[0]
-        return ("lever", handle)
-
-    m = re.search(r'jobs\.ashbyhq\.com/([a-zA-Z0-9\-\._/]+)', html)
-    if m:
-        org = m.group(1).split('/')[0]
-        return ("ashby", org)
-    m = re.search(r'organizationSlug=([a-zA-Z0-9\-\._]+)', html)
-    if m:
-        return ("ashby", m.group(1))
-
-    m = re.search(r'careers\.smartrecruiters\.com/([a-zA-Z0-9\-\._/]+)', html)
-    if m:
-        cid = m.group(1).split('/')[0]
-        return ("smartrecruiters", cid)
-
-    return None
-
-COMMON_PATHS = ["/careers", "/jobs", "/join", "/join-us", "/work-with-us"]
-
-def detect_from_domain(domain: str) -> Optional[Tuple[str, str, str]]:
-    base = domain if domain.startswith("http") else "https://" + domain
-    tried = set()
-    for path in [""] + COMMON_PATHS:
-        url = base if not path else base.rstrip("/") + path
-        if url in tried:
-            continue
-        tried.add(url)
-        html = fetch(url)
+def detect_from_domain(domain: str):
+    """
+    Visits common careers paths for the given domain and tries to detect ATS.
+    """
+    candidates = [
+        f"https://{domain}/careers",
+        f"https://{domain}/jobs",
+        f"https://{domain}/company/careers",
+        f"https://{domain}/about/careers",
+        f"https://{domain}/join-us",
+    ]
+    seen = set()
+    out = []
+    for url in candidates:
+        html = fetch_url(url)
         if not html:
             continue
-        hit = detect_from_html(html)
-        if hit:
-            kind, handle = hit
-            name_guess = domain.split("//")[-1]
-            return (kind, handle, name_guess)
-    return None
+        hits = detect_from_html(html)
+        for it in hits:
+            key = (it["kind"], it["handle"])
+            if key not in seen:
+                seen.add(key)
+                out.append(it)
+    return out

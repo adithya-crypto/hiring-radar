@@ -1,14 +1,24 @@
 import requests
-from typing import Iterator, Dict
 
-def fetch_lever(company_handle: str) -> Iterator[Dict]:
-    url = f"https://api.lever.co/v0/postings/{company_handle}?mode=json"
-    r = requests.get(url, timeout=30); r.raise_for_status()
-    for j in (r.json() or []):
+
+def _lever_get(company_handle: str):
+    url = "https://api.lever.co/v0/postings/{}?mode=json".format(company_handle)
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_lever(company_handle: str):
+    try:
+        data = _lever_get(company_handle)
+    except Exception:
+        return []
+
+    out = []
+    for j in data:
         cats = j.get("categories") or {}
-        yield {
-            "source": "lever",
-            "source_job_id": j.get("id"),
+        out.append({
+            "source_job_id": str(j.get("id")),
             "title": j.get("text"),
             "department": cats.get("team"),
             "location": cats.get("location"),
@@ -16,4 +26,5 @@ def fetch_lever(company_handle: str) -> Iterator[Dict]:
             "created_at": j.get("createdAt"),
             "updated_at": j.get("updatedAt"),
             "status": "OPEN",
-        }
+        })
+    return out

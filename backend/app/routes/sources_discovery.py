@@ -1,87 +1,122 @@
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+import re
+from urllib.parse import urlparse
+
+from fastapi import APIRouter, Body
 from sqlalchemy import text
-from typing import Optional
-from urllib.parse import urlparse, parse_qs
+
 from ..db import SessionLocal
-from ..services.ats_detector import fetch, detect_from_html, detect_from_domain
+from ..services.ats_detector import fetch_url, parse_ats_from_url, detect_from_html, detect_from_domain
 
-router = APIRouter(prefix="/admin/sources", tags=["sources-discovery"])
+router = APIRouter(prefix="/admin/sources", tags=["admin"])
 
-class DiscoverByUrlIn(BaseModel):
-    url: str
-    display_name: Optional[str] = None
 
-class DiscoverByDomainIn(BaseModel):
-    domain: str
-    display_name: Optional[str] = None
+def upsert_source(db, kind: str, handle: str, display_name: str = None, enabled: bool = True):
+    if not kind or not handle:
+        return None
+    row = db.execute(text("""
+        INSERT INTO sources(kind, handle, display_name, enabled)
+        VALUES (:k, :h, :d, :e)
+        ON CONFLICT (kind, handle) DO UPDATE SET
+           display_name = COALESCE(EXCLUDED.display_name, sources.display_name),
+           enabled = EXCLUDED.enabled
+        RETURNING id, kind, handle, display_name, enabled
+    """), {"k": kind, "h": handle, "d": display_name, "e": enabled}).mappings().first()
+    return dict(row) if row else None
 
-def upsert_source(db, kind: str, handle: str, display_name: Optional[str]):
-    db.execute(text("""
-      INSERT INTO sources(kind, handle, display_name, enabled)
-      VALUES (:k, :h, :n, true)
-      ON CONFLICT (kind, handle)
-      DO UPDATE SET display_name=COALESCE(EXCLUDED.display_name, sources.display_name),
-                    enabled=true
-    """), {"k": kind, "h": handle, "n": display_name})
-    db.commit()
-
-def parse_ats_from_url(u: str):
-    try:
-        p = urlparse(u)
-        host = (p.netloc or "").lower()
-        path = (p.path or "/").strip("/")
-
-        if host.endswith("boards.greenhouse.io"):
-            handle = path.split("/")[0] if path else None
-            if handle: return ("greenhouse", handle)
-
-        if host.endswith("jobs.lever.co"):
-            handle = path.split("/")[0] if path else None
-            if handle: return ("lever", handle)
-
-        if host.endswith("jobs.ashbyhq.com"):
-            handle = path.split("/")[0] if path else None
-            if handle: return ("ashby", handle)
-
-        if host.endswith("api.ashbyhq.com"):
-            qs = parse_qs(p.query or "")
-            org = qs.get("organizationSlug", [None])[0]
-            if org: return ("ashby", org)
-
-        if host.endswith("careers.smartrecruiters.com"):
-            handle = path.split("/")[0] if path else None
-            if handle: return ("smartrecruiters", handle)
-    except Exception:
-        pass
-    return None
 
 @router.post("/discover/url")
-def discover_from_url(body: DiscoverByUrlIn):
-    direct = parse_ats_from_url(body.url)
-    if direct:
-        kind, handle = direct
-        db = SessionLocal()
-        upsert_source(db, kind, handle, body.display_name)
-        return {"ok": True, "kind": kind, "handle": handle, "via": "url_parse"}
+def discover_from_url(payload: dict = Body(...)):
+    """
+    Body: { "url": "...", "display_name": "Stripe" }
+    """
+    url = (payload.get("url") or "").strip()
+    display_name = payload.get("display_name")
+    if not url:
+        return {"error": "missing_url"}
 
-    html = fetch(body.url)
+    # 1) direct parse: ATS board URL
+    kind, handle = parse_ats_from_url(url)
+    if kind and handle:
+        db = SessionLocal()
+        try:
+            row = upsert_source(db, kind, handle, display_name, True)
+            db.commit()
+            return {"ok": True, "source": row, "mode": "direct"}
+        finally:
+            db.close()
+
+    # 2) fetch and detect within HTML
+    html = fetch_url(url)
     if not html:
-        raise HTTPException(400, "could_not_fetch_url_or_non_2xx")
-    hit = detect_from_html(html)
-    if not hit:
-        raise HTTPException(404, "no_ats_link_found_in_page")
-    kind, handle = hit
+        return {"error": "fetch_failed"}
+
+    detections = detect_from_html(html)
+    if not detections:
+        return {"detail": "no_ats_link_found_in_page"}
+
     db = SessionLocal()
-    upsert_source(db, kind, handle, body.display_name)
-    return {"ok": True, "kind": kind, "handle": handle, "via": "html_scan"}
+    created = []
+    try:
+        for det in detections:
+            row = upsert_source(db, det["kind"], det["handle"], display_name, True)
+            if row:
+                created.append(row)
+        db.commit()
+        return {"ok": True, "created": created, "mode": "html_detect"}
+    finally:
+        db.close()
+
 
 @router.post("/discover/domain")
-def discover_from_domain_route(body: DiscoverByDomainIn):
-    hit = detect_from_domain(body.domain)
-    if not hit:
-        raise HTTPException(404, "no_ats_detected_from_common_paths")
-    kind, handle, name = hit
+def discover_from_domain(payload: dict = Body(...)):
+    """
+    Body: { "domain": "stripe.com", "display_name": "Stripe" }
+    Tries /careers, /jobs, /company/careers, etc.
+    """
+    domain = (payload.get("domain") or "").strip().lower()
+    display_name = payload.get("display_name")
+    if not domain:
+        return {"error": "missing_domain"}
+
+    detections = detect_from_domain(domain)
+    if not detections:
+        return {"detail": "no_ats_detected_for_domain"}
+
     db = SessionLocal()
-    upsert_source(db, kind, handle, body.display_name or name)
-    return {"ok": True, "kind": kind, "handle": handle}
+    created = []
+    try:
+        for det in detections:
+            row = upsert_source(db, det["kind"], det["handle"], display_name, True)
+            if row:
+                created.append(row)
+        db.commit()
+        return {"ok": True, "created": created, "mode": "domain_probe"}
+    finally:
+        db.close()
+
+
+@router.post("/bulk")
+def bulk_add(payload: dict = Body(...)):
+    """
+    Body: { "items": [ {"kind":"greenhouse","handle":"stripe","display_name":"Stripe"} ] }
+    """
+    items = payload.get("items") or []
+    if not isinstance(items, list) or not items:
+        return {"error": "no_items"}
+    db = SessionLocal()
+    created = []
+    try:
+        for it in items:
+            row = upsert_source(
+                db,
+                (it.get("kind") or "").strip().lower(),
+                (it.get("handle") or "").strip().lower(),
+                it.get("display_name"),
+                bool(it.get("enabled", True)),
+            )
+            if row:
+                created.append(row)
+        db.commit()
+        return {"ok": True, "created": created, "count": len(created)}
+    finally:
+        db.close()
