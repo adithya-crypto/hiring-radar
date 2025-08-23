@@ -4,13 +4,18 @@ from typing import Iterator, Dict
 SR_API = "https://api.smartrecruiters.com"
 
 def fetch_smartrecruiters(company_id: str) -> Iterator[Dict]:
-    # company_id is the SmartRecruiters company identifier
+    """
+    Pulls published jobs from SmartRecruiters for a given companyId.
+    """
     params = {"companyId": company_id, "limit": 200}
     r = requests.get(f"{SR_API}/postings", params=params, timeout=30)
     r.raise_for_status()
-    for p in r.json().get("content", []):
+    for p in r.json().get("content", []) or []:
         pid = p.get("id")
-        d = requests.get(f"{SR_API}/postings/{pid}", timeout=30); d.raise_for_status()
+        if not pid:
+            continue
+        d = requests.get(f"{SR_API}/postings/{pid}", timeout=30)
+        d.raise_for_status()
         j = d.json()
         yield {
             "source": "smartrecruiters",

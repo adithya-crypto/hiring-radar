@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import text
+from typing import Optional
 from ..db import SessionLocal
 from ..services.ats_detector import fetch, detect_from_html, detect_from_domain
 
@@ -8,11 +9,11 @@ router = APIRouter(prefix="/admin/sources", tags=["sources-discovery"])
 
 class DiscoverByUrlIn(BaseModel):
     url: str
-    display_name: str | None = None
+    display_name: Optional[str] = None
 
 class DiscoverByDomainIn(BaseModel):
-    domain: str   # 'example.com' or 'https://example.com'
-    display_name: str | None = None
+    domain: str
+    display_name: Optional[str] = None
 
 def upsert_source(db, kind: str, handle: str, display_name: str | None):
     db.execute(text("""
