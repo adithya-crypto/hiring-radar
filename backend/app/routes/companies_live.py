@@ -14,7 +14,6 @@ def live_companies(limit: int = Query(50, ge=1, le=1000), offset: int = 0):
         c.name,
         c.ats_kind,
         c.ats_handle,
-        -- count OPEN safely (no FILTER -> broad PG compat)
         SUM(CASE WHEN jp.status='OPEN' THEN 1 ELSE 0 END)::int AS open_roles,
         GREATEST(
           COALESCE(MAX(jp.updated_at), to_timestamp(0)),
