@@ -1,13 +1,14 @@
 # backend/app/jobs/run_ingest.py
 from typing import Dict, Any, List, Optional
 import datetime as dt
+import re
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..db import SessionLocal
 
-# Connectors (import-guard for optional ones)
+# Connectors
 from ..connectors.greenhouse import fetch_greenhouse
 try:
     from ..connectors.lever import fetch_lever  # type: ignore
@@ -25,10 +26,10 @@ except Exception:
 UPSERT_SQL = text("""
     INSERT INTO job_postings
         (company_id, source_job_id, title, department, location,
-         apply_url, created_at, updated_at, status, role_family)
+         apply_url, created_at, updated_at, status, role_family, remote_ok)
     VALUES
         (:company_id, :source_job_id, :title, :department, :location,
-         :apply_url, :created_at, :updated_at, :status, :role_family)
+         :apply_url, :created_at, :updated_at, :status, :role_family, :remote_ok)
     ON CONFLICT (company_id, source_job_id) DO UPDATE SET
         title       = EXCLUDED.title,
         department  = EXCLUDED.department,
@@ -36,8 +37,26 @@ UPSERT_SQL = text("""
         apply_url   = EXCLUDED.apply_url,
         updated_at  = EXCLUDED.updated_at,
         status      = EXCLUDED.status,
-        role_family = EXCLUDED.role_family
+        role_family = EXCLUDED.role_family,
+        remote_ok   = EXCLUDED.remote_ok
 """)
+
+_REMOTE_RE = re.compile(r"\bremote\b|\b(wfh|work[-\s]?from[-\s]?home)\b", re.I)
+
+def _infer_remote_ok(title: Optional[str], location: Optional[str]) -> bool:
+    """
+    Conservative remote detection:
+    - True if title or location explicitly contains 'remote' / WFH.
+    - False otherwise (NOT NULL column requires a boolean).
+    """
+    t = (title or "")
+    l = (location or "")
+    if _REMOTE_RE.search(t) or _REMOTE_RE.search(l):
+        return True
+    # common Greenhouse phrasing like "Remote - US", "Remote - Ontario, Canada"
+    if re.search(r"\bremote\s*[-–]\s*", l, re.I):
+        return True
+    return False
 
 def _classify_role_family(title: Optional[str], department: Optional[str]) -> Optional[str]:
     t = (title or "").lower()
@@ -57,18 +76,23 @@ def _normalize_item(company_id: int, it: Dict[str, Any]) -> Dict[str, Any]:
     created = it.get("created_at") or it.get("updated_at") or dt.datetime.utcnow()
     updated = it.get("updated_at") or it.get("created_at") or created
     role_family = it.get("role_family") or _classify_role_family(it.get("title"), it.get("department"))
+    title = it.get("title") or ""
+    department = it.get("department")
+    location = it.get("location")
+    remote_ok = bool(it.get("remote_ok")) or _infer_remote_ok(title, location)
 
     return {
         "company_id": company_id,
         "source_job_id": str(it.get("source_job_id") or it.get("id")),
-        "title": it.get("title") or "",
-        "department": it.get("department"),
-        "location": it.get("location"),
+        "title": title,
+        "department": department,
+        "location": location,
         "apply_url": it.get("apply_url"),
         "created_at": created,
         "updated_at": updated,
         "status": it.get("status") or "OPEN",
         "role_family": role_family,
+        "remote_ok": remote_ok,
     }
 
 def _dispatch(kind: str, handle: str) -> List[Dict[str, Any]]:
