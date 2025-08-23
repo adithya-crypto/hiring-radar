@@ -1,6 +1,8 @@
 from datetime import datetime
 import traceback
 from typing import Optional, Dict, Any
+from math import exp
+from collections import defaultdict
 
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,6 +54,18 @@ try:
     from .jobs.scheduler import attach_scheduler  # if you have one
 except Exception:
     attach_scheduler = None
+
+
+def _safe_norm(values):
+    # returns (min, max, lambda->norm0..1)
+    if not values:
+        return 0.0, 0.0, (lambda x: 0.0)
+    mn, mx = min(values), max(values)
+    if mx <= mn:
+        return mn, mx, (lambda x: 0.0)
+    rng = (mx - mn) * 1.0
+    return mn, mx, (lambda x: max(0.0, min(1.0, (x - mn) / rng)))
+
 
 # -----------------------------
 # Health
@@ -271,6 +285,119 @@ def active_top(
         return JSONResponse(
             status_code=500, content={"error": "active_top_failed", "detail": str(e)}
         )
+    
+@app.get("/scores_live")
+def scores_live(
+    db: Session = Depends(get_db),
+    role_family: str = "SDE",
+    window_days: int = Query(28, ge=7, le=90)
+):
+    """
+    Live score = weighted normalized blend of:
+      - Freshness: postings updated in last 7d
+      - Velocity: (updates 0-14d) - (updates 15-28d), clipped at 0
+      - Volume: total open postings tagged as SWE/SDE
+      - HN presence (binary from signals.kind='hn_whos_hiring' in last 35d)
+      - Layoff penalty: recent layoff decay (90d half-life)
+    """
+    # 1) Feature pulls
+    # Open SWE/SDE
+    rows = db.execute(text("""
+      SELECT c.id AS company_id,
+             SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde') THEN 1 ELSE 0 END)::int AS open_count,
+             SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+                       AND COALESCE(jp.updated_at, jp.created_at) > (now() - interval '7 days')
+                      THEN 1 ELSE 0 END)::int AS fresh_7d,
+             -- 0-14d vs 15-28d buckets
+             SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+                       AND COALESCE(jp.updated_at, jp.created_at) > (now() - interval '14 days')
+                      THEN 1 ELSE 0 END)::int AS upd_0_14,
+             SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+                       AND COALESCE(jp.updated_at, jp.created_at) <= (now() - interval '14 days')
+                       AND COALESCE(jp.updated_at, jp.created_at) > (now() - interval '28 days')
+                      THEN 1 ELSE 0 END)::int AS upd_15_28
+      FROM companies c
+      LEFT JOIN job_postings jp ON jp.company_id = c.id
+      GROUP BY c.id
+    """)).mappings().all()
+
+    feat = {r["company_id"]: {
+        "open_count": int(r["open_count"] or 0),
+        "fresh_7d": int(r["fresh_7d"] or 0),
+        "vel_pos": max(0, int(r["upd_0_14"] or 0) - int(r["upd_15_28"] or 0)),
+    } for r in rows}
+
+    # HN presence (last 35d)
+    rows = db.execute(text("""
+      SELECT company_id, COUNT(*)::int AS n
+      FROM signals
+      WHERE kind='hn_whos_hiring'
+        AND happened_at > (now() - interval '35 days')
+      GROUP BY company_id
+    """)).mappings().all()
+    for r in rows:
+        cid = r["company_id"]
+        if cid in feat:
+            feat[cid]["hn"] = 1
+    for cid in feat:
+        feat[cid].setdefault("hn", 0)
+
+    # Layoff decay (penalty): 1.0 at event, exponential decay ~90d half-life
+    rows = db.execute(text("""
+      SELECT company_id, MAX(happened_at) AS last_layoff
+      FROM signals
+      WHERE kind='layoff'
+      GROUP BY company_id
+    """)).mappings().all()
+    import datetime as dt
+    now = dt.datetime.utcnow().replace(tzinfo=None)
+    for r in rows:
+        cid = r["company_id"]
+        t = r["last_layoff"]
+        if t and cid in feat:
+            # half-life ~90d => decay factor
+            days = max(0.0, (now - t.replace(tzinfo=None)).total_seconds()/86400.0)
+            decay = 0.5 ** (days / 90.0)  # 1 -> ~0 over ~months
+            feat[cid]["layoff_penalty"] = decay
+    for cid in feat:
+        feat[cid].setdefault("layoff_penalty", 0.0)
+
+    # 2) Normalize features across companies
+    opens = [v["open_count"] for v in feat.values()]
+    fresh = [v["fresh_7d"] for v in feat.values()]
+    vpos  = [v["vel_pos"] for v in feat.values()]
+    _, _, norm_open = _safe_norm(opens)
+    _, _, norm_fresh = _safe_norm(fresh)
+    _, _, norm_vpos = _safe_norm(vpos)
+
+    # 3) Weighted blend (0..100)
+    out = []
+    for cid, v in feat.items():
+        s = (
+            0.35 * norm_fresh(v["fresh_7d"]) +     # emphasize very recent activity
+            0.30 * norm_vpos(v["vel_pos"]) +      # momentum
+            0.20 * norm_open(v["open_count"]) +   # size, but capped by norm
+            0.10 * (1.0 if v.get("hn") else 0.0)  # community signal
+            - 0.15 * v.get("layoff_penalty", 0.0) # recent layoffs penalty
+        )
+        score = int(round(max(0.0, min(1.0, s)) * 100))
+        out.append({
+            "company_id": cid,
+            "score": score,
+            "features": v,
+        })
+
+    # Attach company names for UI
+    if out:
+        ids = tuple([o["company_id"] for o in out])
+        q = text("SELECT id, name FROM companies WHERE id = ANY(:ids)")
+        names = {r[0]: r[1] for r in db.execute(q, {"ids": list(ids)}).fetchall()}
+        for o in out:
+            o["company_name"] = names.get(o["company_id"], f"id:{o['company_id']}")
+
+    # Highest-first
+    out.sort(key=lambda x: (-x["score"], x["company_name"]))
+    return out    
 
 # Legacy (kept)
 @app.get("/active")
