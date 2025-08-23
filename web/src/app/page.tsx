@@ -1,558 +1,426 @@
-'use client'
-import React, { useEffect, useMemo, useState } from 'react'
+from datetime import datetime
+import traceback
+from math import exp
+from typing import Optional, Dict, Any, List
 
-/**
- * API base:
- * - Prefer NEXT_PUBLIC_API_BASE if set (Vercel)
- * - Fallback to Render API on vercel.app
- * - Else default to localhost (dev)
- */
-const API =
-  process.env.NEXT_PUBLIC_API_BASE
-  || (typeof window !== 'undefined' && window.location.hostname.endsWith('vercel.app')
-      ? 'https://hiring-radar-api.onrender.com'
-      : 'http://localhost:8000')
+from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from sqlalchemy import text
 
-/* ---------------- Types (normalized) ---------------- */
-type MetricsRow = {
-  company_id: number
-  company_name: string
-  sde_openings?: number | null
-  sde_new?: number | null
-  sde_closed?: number | null
-  score?: number | null
-  details_json?: { new_last_4w?: number; open_now?: number } | null
-  open_count?: number | null
-}
+from .config import settings
+from . import crud
+from .models import Signal
+from .db import SessionLocal  # DB session factory
 
-type UiRow = {
-  company_id: number
-  company_name: string
-  score: number        // main score we display (prefer “new”)
-  open_now: number     // open SDE count
-  new_28d: number      // last-28-day new count (if known)
-}
+# Routers
+from .routes.tasks import router as tasks_router
+from .routes.companies_live import router as companies_live_router
+from .routes.sources_admin import router as sources_admin_router
+from .routes.sources_discovery import router as sources_discovery_router
 
-type Company = { id: number; name: string; ticker?: string | null }
 
-type Posting = {
-  id: number
-  title: string
-  location?: string | null
-  department?: string | null
-  apply_url?: string | null
-  created_at?: string
-  updated_at?: string
-  role_family?: string | null
-}
+# ---------- DB session dependency ----------
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-type TimeFilter = 'all' | '24h' | '48h' | '72h' | '7d' | '14d' | '30d'
-type ViewMode = 'top' | 'new'
 
-/* ---------------- Helpers ---------------- */
-const STATE_ABBRS = new Set([
-  'AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN',
-  'MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA',
-  'WA','WV','WI','WY','DC'
-])
-const STATE_NAMES = [
-  'Alabama','Alaska','Arizona','Arkansas','California','Colorado','Connecticut','Delaware','Florida','Georgia',
-  'Hawaii','Idaho','Illinois','Indiana','Iowa','Kansas','Kentucky','Louisiana','Maine','Maryland','Massachusetts',
-  'Michigan','Minnesota','Mississippi','Missouri','Montana','Nebraska','Nevada','New Hampshire','New Jersey',
-  'New Mexico','New York','North Carolina','North Dakota','Ohio','Oklahoma','Oregon','Pennsylvania','Rhode Island',
-  'South Carolina','South Dakota','Tennessee','Texas','Utah','Vermont','Virginia','Washington','West Virginia',
-  'Wisconsin','Wyoming','District of Columbia','Washington, DC','D.C.','DC'
-]
-function isUS(loc?: string | null): boolean {
-  if (!loc) return false
-  const raw = loc.trim()
-  const L = raw.toLowerCase()
-  if (L.includes('united states') || L.includes('united states of america') || /\b(u\.s\.a?|usa)\b/i.test(raw)) return true
-  if (/\b(us|u\.s\.a?)\b.*\bremote\b/i.test(raw) || /\bremote\b.*\b(us|u\.s\.a?)\b/i.test(raw) || /\bus-?remote\b/i.test(raw)) return true
-  const abbrMatch = /(?:^|,|\s)\b([A-Z]{2})\b(?:\s|,|$)/.exec(raw)
-  if (abbrMatch && STATE_ABBRS.has(abbrMatch[1])) { if (!/canada/i.test(raw)) return true }
-  for (const name of STATE_NAMES) {
-    const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
-    if (re.test(raw)) return true
-  }
-  return false
-}
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI(title="Hiring Radar API", version="0.2.0")
 
-/** Safely unwrap API JSON that might be: array, {ok:true}[], {items:[...]}, or {error:...} */
-async function getJson(url: string) {
-  const r = await fetch(url, { cache: 'no-store' })
-  const raw = await r.json().catch(() => null)
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=getattr(settings, "ALLOWED_ORIGINS", ["*"]),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-  // If backend sometimes returns `{ ok: true }[...]` (invalid JSON envelope the curl showed was
-  // two separate JSON payloads). In fetch, you'll only get the last JSON. Handle common shapes:
-  if (Array.isArray(raw)) return raw
-  if (!raw) return []
-  if (raw.error) throw new Error(raw.detail || raw.error)
-  if (Array.isArray(raw.items)) return raw.items
-  if (Array.isArray(raw.data)) return raw.data
-  // Some endpoints just return a dict of company -> count; that's not what we need here.
-  // Fall back to empty if it doesn't look like our rows.
-  return raw
-}
+# Include routers
+app.include_router(tasks_router)
+app.include_router(companies_live_router)
+app.include_router(sources_admin_router)
+app.include_router(sources_discovery_router)
 
-/** Normalize one mixed row into UiRow */
-function toUiRow(m: MetricsRow): UiRow {
-  // Prefer a “new last 4w” metric when provided by backend
-  const new28 =
-    (m.details_json?.new_last_4w ?? null) ??
-    (m.sde_new ?? null) ??
-    (m.score ?? 0)
 
-  // “open_now” can come from sde_openings or details_json.open_now or open_count
-  const open =
-    (m.sde_openings ?? null) ??
-    (m.details_json?.open_now ?? null) ??
-    (m.open_count ?? 0)
+# -----------------------------
+# Request models
+# -----------------------------
+class CompanyIn(BaseModel):
+    name: str
+    careers_url: str
+    ats_kind: str  # "greenhouse" | "lever" | "ashby" | "smartrecruiters"
 
-  // “score” in the table = the near-term activity signal.
-  const score =
-    (m.sde_new ?? null) ??
-    (m.details_json?.new_last_4w ?? null) ??
-    (m.score ?? 0)
+class SignalIn(BaseModel):
+    company_id: int
+    kind: str  # "hn_whos_hiring" | "layoff" | "funding" | "earnings"
+    happened_at: datetime
+    payload_json: Optional[Dict[str, Any]] = None
 
-  return {
-    company_id: m.company_id,
-    company_name: m.company_name,
-    score: Number(score || 0),
-    open_now: Number(open || 0),
-    new_28d: Number(new28 || 0),
-  }
-}
 
-export default function Page() {
-  const [rows, setRows] = useState<UiRow[]>([])
-  const [companies, setCompanies] = useState<Record<number, Company>>({})
-  const [loading, setLoading] = useState(true)
-  const [busy, setBusy] = useState(false)
-  const [minScore, setMinScore] = useState<number>(0)
-  const [companyQuery, setCompanyQuery] = useState<string>('')
-  const [debouncedQuery, setDebouncedQuery] = useState<string>('')
-  const [error, setError] = useState<string | null>(null)
+# -----------------------------
+# Health
+# -----------------------------
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-  const [mode, setMode] = useState<ViewMode>('top')
-  const [newDays, setNewDays] = useState<7 | 14 | 30>(7)
+@app.get("/health/db")
+def health_db(db: Session = Depends(get_db)):
+    db.execute(text("select 1"))
+    return {"ok": True}
 
-  // Company panel
-  const [companyPanelOpen, setCompanyPanelOpen] = useState(false)
-  const [panelCompanyId, setPanelCompanyId] = useState<number | null>(null)
-  const [panelTimeFilter, setPanelTimeFilter] = useState<TimeFilter>('all')
-  const [panelLoading, setPanelLoading] = useState(false)
-  const [panelPostings, setPanelPostings] = useState<Posting[]>([])
-  const [usOnly, setUsOnly] = useState<boolean>(true)
 
-  // Debounce
-  useEffect(() => {
-    const t = setTimeout(() => setDebouncedQuery(companyQuery.trim().toLowerCase()), 200)
-    return () => clearTimeout(t)
-  }, [companyQuery])
+# -----------------------------
+# Companies (simple helpers)
+# -----------------------------
+@app.get("/companies")
+def list_companies(db: Session = Depends(get_db)):
+    return crud.list_companies(db)
 
-  const panelCompanyName = useMemo(
-    () => (panelCompanyId ? (companies[panelCompanyId]?.name || String(panelCompanyId)) : ''),
-    [panelCompanyId, companies]
-  )
+@app.get("/companies/{company_id}")
+def company_detail(company_id: int, db: Session = Depends(get_db)):
+    obj = crud.company_detail(db, company_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="company_not_found")
+    return obj
 
-  // Load companies once so we can show names even if some APIs omit them
-  async function loadCompanies() {
-    try {
-      const res = await getJson(`${API}/companies`)
-      if (Array.isArray(res)) {
-        const cmap: Record<number, Company> = {}
-        res.forEach((c: any) => { if (c?.id) cmap[c.id] = c })
-        setCompanies(cmap)
-      }
-    } catch { /* ignore */ }
-  }
+@app.get("/companies/{company_id}/postings")
+def company_postings(
+    company_id: int,
+    role_family: str = "SDE",
+    since_hours: Optional[int] = None,
+    since_days: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    obj = crud.company_detail(db, company_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="company_not_found")
 
-  // Normalize API rows -> UI rows (defensive for non-arrays)
-  function normalizeArray(maybeArr: any): UiRow[] {
-    if (!maybeArr) return []
-    const arr = Array.isArray(maybeArr) ? maybeArr : []
-    return arr
-      .filter(Boolean)
-      .map((r: any) => toUiRow(r))
-  }
+    return crud.list_company_postings(
+        db,
+        company_id=company_id,
+        role_family=role_family,
+        since_hours=since_hours,
+        since_days=since_days,
+    )
 
-  async function fetchTop() {
-    setBusy(true); setError(null)
-    try {
-      const [scoresJson] = await Promise.all([
-        getJson(`${API}/active_top?family=swe&limit=50`),
-        loadCompanies(),
-      ])
-      const ui = normalizeArray(scoresJson)
-      // If backend did not include names, hydrate from companies map (after a tick)
-      setRows(ui.sort((a, b) => (b.score - a.score) || (b.open_now - a.open_now)))
-    } catch (e: any) {
-      setError(e?.message || 'Failed to load data')
-      setRows([])
-    } finally { setBusy(false); setLoading(false) }
-  }
 
-  async function fetchTopNew(days = 7) {
-    setBusy(true); setError(null)
-    try {
-      // Try the dedicated endpoint first
-      let payload = await getJson(`${API}/active_top_new?role_family=SDE&days=${days}&limit=50`)
-      // If the endpoint returns a non-array (some JSON envelope), coerce to array if possible
-      if (!Array.isArray(payload)) {
-        // Fallback to /scores (original scorer)
-        payload = await getJson(`${API}/scores?limit=50`)
-      }
-      const ui = normalizeArray(payload)
-      setRows(ui.sort((a, b) => (b.score - a.score) || (b.open_now - a.open_now)))
-    } catch (e: any) {
-      // Final fallback: use /scores if /active_top_new failed
-      try {
-        const payload = await getJson(`${API}/scores?limit=50`)
-        const ui = normalizeArray(payload)
-        setRows(ui.sort((a, b) => (b.score - a.score) || (b.open_now - a.open_now)))
-      } catch (ee: any) {
-        setError(e?.message || ee?.message || 'Failed to load new companies')
-        setRows([])
-      }
-    } finally { setBusy(false); setLoading(false) }
-  }
+# -----------------------------
+# Signals
+# -----------------------------
+@app.post("/signals")
+def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
+    s = Signal(
+        company_id=payload.company_id,
+        kind=payload.kind,
+        happened_at=payload.happened_at,
+        payload_json=payload.payload_json,
+    )
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return {"ok": True, "id": s.id}
 
-  useEffect(() => { fetchTop() }, [])
 
-  const filtered = rows.filter((r) => {
-    const meetsScore = r.score >= minScore
-    const name = r.company_name?.toLowerCase() || ''
-    const meetsQuery = debouncedQuery ? name.includes(debouncedQuery) : true
-    return meetsScore && meetsQuery
-  })
+# -----------------------------
+# Legacy/Original-style scores
+# -----------------------------
+def compute_activity_score(sde_new: int, sde_openings: int) -> int:
+    # Emphasize recent activity, cap openings influence so whales don't dominate
+    return 3 * int(sde_new or 0) + min(int(sde_openings or 0), 50)
 
-  async function openCompanyPanel(companyId: number, tf: TimeFilter = 'all') {
-    setPanelCompanyId(companyId)
-    setPanelTimeFilter(tf)
-    setCompanyPanelOpen(true)
-    await fetchCompanyPostings(companyId, tf)
-  }
+@app.get("/scores")
+def scores(
+    db: Session = Depends(get_db),
+    role_family: str = "software",
+    limit: int = 50
+):
+    """
+    Original-style materialized rows from hiring_score (if you populate it).
+    Returns array shaped for the frontend table.
+    """
+    sql = text("""
+        SELECT
+          c.id   AS company_id,
+          c.name AS company_name,
+          hs.score,
+          hs.details_json
+        FROM hiring_score hs
+        JOIN companies c ON c.id = hs.company_id
+        WHERE lower(hs.role_family) IN (:rf1, :rf2, :rf3)
+        ORDER BY hs.score DESC, c.name
+        LIMIT :limit
+    """)
+    rows = db.execute(sql, {
+        "rf1": role_family.lower(),
+        "rf2": "swe",
+        "rf3": "sde",
+        "limit": limit
+    }).mappings().all()
 
-  async function fetchCompanyPostings(companyId: number, tf: TimeFilter) {
-    setPanelLoading(true)
-    try {
-      const url = new URL(`${API}/companies/${companyId}/postings`)
-      url.searchParams.set('role_family', 'SDE')
-      switch (tf) {
-        case '24h': url.searchParams.set('since_hours', '24'); break
-        case '48h': url.searchParams.set('since_hours', '48'); break
-        case '72h': url.searchParams.set('since_hours', '72'); break
-        case '7d': url.searchParams.set('since_days', '7'); break
-        case '14d': url.searchParams.set('since_days', '14'); break
-        case '30d': url.searchParams.set('since_days', '30'); break
-        case 'all':
-        default: break
-      }
-      const data = await getJson(url.toString())
-      const arr = Array.isArray(data) ? (data as Posting[]) : []
-      setPanelPostings(arr)
-    } catch {
-      setPanelPostings([])
-    } finally { setPanelLoading(false) }
-  }
+    out = []
+    for r in rows:
+        dj = r["details_json"] or {}
+        out.append({
+            "company_id":   r["company_id"],
+            "company_name": r["company_name"],
+            "role_family":  role_family,
+            "score":        int(r["score"] or 0),
+            "details_json": dj,
+            "evidence_urls": (dj.get("evidence_urls") or []),
+            "open_count":    dj.get("open_now"),
+        })
+    return out
 
-  // --- Presentational helpers ---
-  const badge = (txt: string, tone: 'zinc' | 'emerald' | 'amber' | 'blue' = 'zinc') => {
-    const map: Record<string,string> = {
-      zinc: 'bg-zinc-100 text-zinc-700',
-      emerald: 'bg-emerald-100 text-emerald-700',
-      amber: 'bg-amber-100 text-amber-800',
-      blue: 'bg-blue-100 text-blue-700',
-    }
-    return <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs ${map[tone]} whitespace-nowrap`}>{txt}</span>
-  }
+@app.get("/active_top")
+def active_top(
+    family: str = "swe",
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """
+    Top companies for the current week by SWE activity (job_metrics).
+    Returns UI-friendly fields: score (weighted), open_count, details_json.new_last_4w.
+    """
+    try:
+        sql = text("""
+            SELECT
+              c.id   AS company_id,
+              c.name AS company_name,
+              jm.sde_new,
+              jm.sde_openings,
+              jm.sde_closed
+            FROM job_metrics jm
+            JOIN companies c ON c.id = jm.company_id
+            WHERE jm.week_start = date_trunc('week', now())
+              AND jm.role_family IN (:family, 'software')
+              AND (jm.sde_openings > 0 OR jm.sde_new > 0)
+            ORDER BY jm.sde_new DESC, jm.sde_openings DESC, c.name
+            LIMIT :limit
+        """)
+        rows = db.execute(sql, {"family": family, "limit": limit}).mappings().all()
 
-  const shimmerRow = (i: number) => (
-    <tr key={`skeleton-${i}`} className="animate-pulse">
-      <td className="p-3"><div className="h-4 w-40 rounded bg-zinc-200" /></td>
-      <td className="p-3"><div className="h-4 w-10 rounded bg-zinc-200" /></td>
-      <td className="p-3"><div className="h-4 w-14 rounded bg-zinc-200" /></td>
-      <td className="p-3"><div className="h-4 w-14 rounded bg-zinc-200" /></td>
-      <td className="p-3"><div className="h-8 w-16 rounded bg-zinc-200" /></td>
-    </tr>
-  )
+        out = []
+        for r in rows:
+            sde_new = int(r["sde_new"] or 0)
+            sde_open = int(r["sde_openings"] or 0)
+            score = compute_activity_score(sde_new, sde_open)
+            out.append({
+                "company_id": r["company_id"],
+                "company_name": r["company_name"],
+                "sde_openings": sde_open,
+                "sde_new": sde_new,
+                "sde_closed": int(r["sde_closed"] or 0),
+                # UI fields:
+                "score": score,
+                "open_count": sde_open,
+                "details_json": {"new_last_4w": sde_new, "score_formula": "3*new + min(open,50)"},
+                "evidence_urls": [],
+            })
+        return out
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("[/active_top] error:", repr(e), "\n", tb)
+        return JSONResponse(
+            status_code=500, content={"error": "active_top_failed", "detail": str(e)}
+        )
 
-  const panelPostingsFiltered = useMemo(() => {
-    if (!usOnly) return panelPostings
-    return panelPostings.filter(p => isUS(p.location))
-  }, [panelPostings, usOnly])
+@app.get("/active_top_new")
+def active_top_new(
+    role_family: str = "SDE",
+    days: int = Query(7, ge=1, le=90),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """
+    Top 'new' companies created in the last {days} days.
+    Uses SUM(CASE ...) instead of FILTER for maximum compatibility.
+    """
+    try:
+        sql = text("""
+            SELECT
+              c.id   AS company_id,
+              c.name AS company_name,
+              -- total SWE/SDE postings for the company
+              SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde') THEN 1 ELSE 0 END)::int AS sde_openings,
+              -- postings considered "new" in the last :days
+              SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+                        AND COALESCE(jp.updated_at, jp.created_at) > (now() - make_interval(days => :days))
+                       THEN 1 ELSE 0 END)::int AS sde_new
+            FROM companies c
+            LEFT JOIN job_postings jp
+              ON jp.company_id = c.id
+            WHERE c.created_at > (now() - make_interval(days => :days))
+            GROUP BY c.id, c.name
+            HAVING
+              SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+                         AND COALESCE(jp.updated_at, jp.created_at) > (now() - make_interval(days => :days))
+                       THEN 1 ELSE 0 END) > 0
+              OR
+              SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde') THEN 1 ELSE 0 END) > 0
+            ORDER BY sde_new DESC, sde_openings DESC, c.name
+            LIMIT :limit
+        """)
+        rows = db.execute(sql, {"days": days, "limit": limit}).mappings().all()
 
-  return (
-    <main className="mx-auto max-w-6xl p-6">
-      {/* Page header */}
-      <div className="mb-6 flex flex-wrap items-center gap-3">
-        <h1 className="text-2xl font-semibold tracking-tight">Hiring Radar</h1>
-        {mode === 'new'
-          ? badge(`New (last ${newDays}d)`, 'amber')
-          : badge('Top companies', 'blue')}
-        <span className="text-sm text-zinc-500">Live view of companies actively hiring SDEs</span>
-      </div>
+        out = []
+        for r in rows:
+            sde_new = int(r["sde_new"] or 0)
+            sde_open = int(r["sde_openings"] or 0)
+            score = compute_activity_score(sde_new, sde_open)
+            out.append({
+                "company_id": r["company_id"],
+                "company_name": r["company_name"],
+                "sde_openings": sde_open,
+                "sde_new": sde_new,
+                "sde_closed": 0,
+                "score": score,
+                "open_count": sde_open,
+                "details_json": {"window_days": days, "new_last_4w": sde_new, "score_formula": "3*new + min(open,50)"},
+                "evidence_urls": [],
+            })
+        return out
+    except Exception as e:
+        print("[/active_top_new] error:", repr(e))
+        return {"error": "active_top_new_failed", "detail": str(e)}
 
-      {/* Controls card */}
-      <div className="mb-6 rounded-2xl border bg-white p-4 shadow-sm">
-        <div className="flex flex-wrap items-center gap-3">
-          {/* Segmented control */}
-          <div className="flex rounded-xl border p-1">
-            <button
-              className={`rounded-lg px-3 py-1.5 text-sm ${mode==='top' ? 'bg-zinc-900 text-white' : 'text-zinc-700 hover:bg-zinc-50'}`}
-              onClick={async () => { setMode('top'); await fetchTop() }}
-              disabled={busy || mode==='top'}
-            >
-              Top (overall)
-            </button>
-            <button
-              className={`rounded-lg px-3 py-1.5 text-sm ${mode==='new' ? 'bg-zinc-900 text-white' : 'text-zinc-700 hover:bg-zinc-50'}`}
-              onClick={async () => { setMode('new'); await fetchTopNew(newDays) }}
-              disabled={busy || mode==='new'}
-            >
-              New
-            </button>
-          </div>
 
-          {/* New window picker */}
-          {mode === 'new' && (
-            <select
-              className="rounded-lg border px-2 py-1.5 text-sm"
-              value={newDays}
-              onChange={async (e) => {
-                const d = Number(e.target.value) as 7|14|30
-                setNewDays(d)
-                await fetchTopNew(d)
-              }}
-            >
-              <option value={7}>Last 7 days</option>
-              <option value={14}>Last 14 days</option>
-              <option value={30}>Last 30 days</option>
-            </select>
-          )}
+# -----------------------------
+# New: Live score (normalized & momentum-aware)
+# -----------------------------
+def _safe_norm(values: List[int]):
+    if not values:
+        return 0.0, 0.0, (lambda x: 0.0)
+    mn, mx = min(values), max(values)
+    if mx <= mn:
+        return mn, mx, (lambda x: 0.0)
+    rng = float(mx - mn)
+    return mn, mx, (lambda x: max(0.0, min(1.0, (float(x) - mn) / rng)))
 
-          {/* Actions */}
-          <div className="mx-2 h-6 w-px bg-zinc-200" />
-          <button
-            className="rounded-lg bg-black px-3 py-2 text-sm text-white disabled:opacity-60"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true); setError(null)
-              try {
-                const r = await fetch(`${API}/tasks/ingest`, { method: 'POST' })
-                if (!r.ok) throw new Error(`POST /tasks/ingest ${r.status}`)
-                mode === 'new' ? await fetchTopNew(newDays) : await fetchTop()
-              } catch (e: any) { setError(e?.message || 'Ingest failed') }
-              finally { setBusy(false) }
-            }}
-          >
-            {busy ? 'Running…' : 'Run Ingest'}
-          </button>
-          <button
-            className="rounded-lg bg-zinc-900 px-3 py-2 text-sm text-white disabled:opacity-60"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true); setError(null)
-              try {
-                const r = await fetch(`${API}/tasks/forecast`, { method: 'POST' })
-                if (!r.ok) throw new Error(`POST /tasks/forecast ${r.status}`)
-                mode === 'new' ? await fetchTopNew(newDays) : await fetchTop()
-              } catch (e: any) { setError(e?.message || 'Forecast failed') }
-              finally { setBusy(false) }
-            }}
-          >
-            {busy ? 'Computing…' : 'Run Forecast'}
-          </button>
-          <button
-            className="rounded-lg border px-3 py-2 text-sm disabled:opacity-60"
-            disabled={busy}
-            onClick={async () => mode==='new' ? await fetchTopNew(newDays) : await fetchTop()}
-          >
-            Refresh
-          </button>
+@app.get("/scores_live")
+def scores_live(
+    db: Session = Depends(get_db),
+    role_family: str = "SDE",
+    window_days: int = Query(28, ge=7, le=90)
+):
+    """
+    Live score = weighted normalized blend of:
+      - Freshness: postings updated in last 7d
+      - Momentum: (updates 0–14d) - (15–28d), clipped at 0
+      - Volume: total open postings tagged as SWE/SDE
+      - HN presence (binary from signals.kind='hn_whos_hiring' in last 35d)
+      - Layoff penalty: recent layoff decay (90d half-life)
+    """
+    # 1) Feature pulls (no FILTER clause)
+    rows = db.execute(text("""
+      SELECT c.id AS company_id,
+             SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde') THEN 1 ELSE 0 END)::int AS open_count,
+             SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+                        AND COALESCE(jp.updated_at, jp.created_at) > (now() - interval '7 days')
+                      THEN 1 ELSE 0 END)::int AS fresh_7d,
+             SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+                        AND COALESCE(jp.updated_at, jp.created_at) > (now() - interval '14 days')
+                      THEN 1 ELSE 0 END)::int AS upd_0_14,
+             SUM(CASE WHEN lower(COALESCE(jp.role_family,'')) IN ('swe','software','sde')
+                        AND COALESCE(jp.updated_at, jp.created_at) <= (now() - interval '14 days')
+                        AND COALESCE(jp.updated_at, jp.created_at) > (now() - interval '28 days')
+                      THEN 1 ELSE 0 END)::int AS upd_15_28
+      FROM companies c
+      LEFT JOIN job_postings jp ON jp.company_id = c.id
+      GROUP BY c.id
+    """)).mappings().all()
 
-          {/* Right-aligned filters */}
-          <div className="ml-auto flex items-center gap-3">
-            <div className="relative">
-              <input
-                type="text"
-                value={companyQuery}
-                onChange={(e) => setCompanyQuery(e.target.value)}
-                placeholder="Search company…"
-                className="w-56 rounded-lg border px-3 py-2 text-sm pr-8"
-              />
-              <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-zinc-400">⌘K</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <label className="text-sm text-zinc-600" htmlFor="minScore">Min score</label>
-              <input
-                id="minScore"
-                type="number"
-                value={minScore}
-                min={0}
-                max={1000}
-                onChange={(e) => setMinScore(Number(e.target.value))}
-                className="w-24 rounded-lg border px-2 py-2 text-sm"
-              />
-            </div>
-          </div>
-        </div>
+    feat = {}
+    for r in rows:
+        feat[r["company_id"]] = {
+            "open_count": int(r["open_count"] or 0),
+            "fresh_7d": int(r["fresh_7d"] or 0),
+            "vel_pos": max(0, int(r["upd_0_14"] or 0) - int(r["upd_15_28"] or 0)),
+            "hn": 0,
+            "layoff_penalty": 0.0,
+        }
 
-        {/* Inline error alert */}
-        {error && (
-          <div className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
-            <div className="flex items-center justify-between">
-              <span>⚠️ {error}</span>
-              <button className="rounded px-2 py-1 hover:bg-red-100" onClick={() => setError(null)}>Dismiss</button>
-            </div>
-          </div>
-        )}
-      </div>
+    # HN presence (last 35d)
+    rows = db.execute(text("""
+      SELECT company_id, COUNT(*)::int AS n
+      FROM signals
+      WHERE kind='hn_whos_hiring'
+        AND happened_at > (now() - interval '35 days')
+      GROUP BY company_id
+    """)).mappings().all()
+    for r in rows:
+        cid = r["company_id"]
+        if cid in feat:
+            feat[cid]["hn"] = 1
 
-      {/* Results card */}
-      <div className="overflow-hidden rounded-2xl border bg-white shadow-sm">
-        <div className="max-h-[70vh] overflow-auto">
-          <table className="w-full table-fixed">
-            <thead className="sticky top-0 z-10 bg-white/95 backdrop-blur text-left text-xs font-medium text-zinc-600">
-              <tr className="border-b">
-                <th className="p-3">Company</th>
-                <th className="w-24 p-3">Score (new)</th>
-                <th className="w-32 p-3">Open SDE</th>
-                <th className="w-32 p-3">New (28d)</th>
-                <th className="w-28 p-3">Openings</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {loading
-                ? Array.from({ length: 10 }).map((_, i) => shimmerRow(i))
-                : filtered.length > 0
-                  ? filtered.map((r) => (
-                      <tr key={r.company_id} className="hover:bg-zinc-50">
-                        <td className="p-3">
-                          <div className="flex items-center gap-2">
-                            <button
-                              className="truncate text-sm font-medium text-blue-600 hover:underline"
-                              onClick={() => openCompanyPanel(r.company_id, 'all')}
-                              title="View openings"
-                            >
-                              {r.company_name}
-                            </button>
-                            {r.score >= 20 && badge('Active', 'emerald')}
-                          </div>
-                        </td>
-                        <td className="p-3 align-top">{r.score}</td>
-                        <td className="p-3 align-top">{r.open_now}</td>
-                        <td className="p-3 align-top">{r.new_28d}</td>
-                        <td className="p-3 align-top">
-                          <button
-                            className="rounded-lg border px-2 py-1 text-xs hover:bg-zinc-50"
-                            onClick={() => openCompanyPanel(r.company_id)}
-                          >
-                            View
-                          </button>
-                        </td>
-                      </tr>
-                    ))
-                  : (
-                    <tr>
-                      <td className="p-6 text-center text-zinc-500" colSpan={5}>
-                        No companies match your filters.
-                      </td>
-                    </tr>
-                  )
-              }
-            </tbody>
-          </table>
-        </div>
-      </div>
+    # Layoff decay (penalty)
+    rows = db.execute(text("""
+      SELECT company_id, MAX(happened_at) AS last_layoff
+      FROM signals
+      WHERE kind='layoff'
+      GROUP BY company_id
+    """)).mappings().all()
+    import datetime as dt
+    now = dt.datetime.utcnow().replace(tzinfo=None)
+    for r in rows:
+        cid = r["company_id"]
+        t = r["last_layoff"]
+        if t and cid in feat:
+            days = max(0.0, (now - t.replace(tzinfo=None)).total_seconds()/86400.0)
+            decay = 0.5 ** (days / 90.0)
+            feat[cid]["layoff_penalty"] = decay
 
-      {/* Company slide-over */}
-      {companyPanelOpen && (
-        <div className="fixed inset-0 z-40">
-          <div className="absolute inset-0 bg-black/40" onClick={() => setCompanyPanelOpen(false)} />
-          <div className="absolute right-0 top-0 flex h-full w-full max-w-2xl flex-col bg-white shadow-2xl">
-            {/* Header */}
-            <div className="flex items-center justify-between border-b p-4">
-              <div>
-                <h3 className="text-base font-semibold">{panelCompanyName}</h3>
-                <p className="text-xs text-zinc-500">Open SDE roles</p>
-              </div>
-              <button className="rounded px-2 py-1 text-sm hover:bg-zinc-100" onClick={() => setCompanyPanelOpen(false)}>
-                Close
-              </button>
-            </div>
+    # Normalize features
+    opens = [v["open_count"] for v in feat.values()]
+    fresh = [v["fresh_7d"] for v in feat.values()]
+    vpos  = [v["vel_pos"] for v in feat.values()]
+    _, _, norm_open  = _safe_norm(opens)
+    _, _, norm_fresh = _safe_norm(fresh)
+    _, _, norm_vpos  = _safe_norm(vpos)
 
-            {/* Filters */}
-            <div className="flex items-center gap-2 border-b p-3">
-              <span className="text-xs text-zinc-600">Posted/updated:</span>
-              {(['all','24h','48h','72h','7d','14d','30d'] as TimeFilter[]).map((tf) => (
-                <button
-                  key={tf}
-                  className={`rounded-lg px-2 py-1 text-xs border ${
-                    panelTimeFilter === tf ? 'bg-zinc-900 text-white' : 'bg-white hover:bg-zinc-50'
-                  }`}
-                  onClick={async () => {
-                    if (panelCompanyId == null) return
-                    setPanelTimeFilter(tf)
-                    await fetchCompanyPostings(panelCompanyId, tf)
-                  }}
-                >
-                  {tf.toUpperCase()}
-                </button>
-              ))}
-              <label className="ml-auto flex items-center gap-2 text-xs">
-                <input type="checkbox" checked={usOnly} onChange={(e) => setUsOnly(e.target.checked)} />
-                US only
-              </label>
-            </div>
+    # Weighted blend → 0..100
+    out = []
+    for cid, v in feat.items():
+        s = (
+            0.35 * norm_fresh(v["fresh_7d"]) +
+            0.30 * norm_vpos(v["vel_pos"])  +
+            0.20 * norm_open(v["open_count"]) +
+            0.10 * (1.0 if v.get("hn") else 0.0) -
+            0.15 * v.get("layoff_penalty", 0.0)
+        )
+        score = int(round(max(0.0, min(1.0, s)) * 100))
+        out.append({
+            "company_id": cid,
+            "score": score,
+            "features": v,
+        })
 
-            {/* Content */}
-            <div className="flex-1 overflow-y-auto p-4">
-              {panelLoading ? (
-                <div className="space-y-3">
-                  {Array.from({ length: 6 }).map((_, i) => (
-                    <div key={i} className="animate-pulse rounded-xl border p-3">
-                      <div className="h-4 w-48 rounded bg-zinc-200" />
-                      <div className="mt-2 h-3 w-72 rounded bg-zinc-200" />
-                    </div>
-                  ))}
-                </div>
-              ) : panelPostingsFiltered.length === 0 ? (
-                <p className="text-sm text-zinc-500">No postings match this filter.</p>
-              ) : (
-                <ul className="space-y-3">
-                  {panelPostingsFiltered.map((p) => (
-                    <li key={p.id} className="rounded-xl border p-3 hover:bg-zinc-50">
-                      <div className="flex items-start justify-between gap-4">
-                        <div className="min-w-0">
-                          <a
-                            href={p.apply_url || '#'}
-                            target="_blank"
-                            rel="noreferrer"
-                            className={`line-clamp-2 font-medium ${p.apply_url ? 'text-blue-600 hover:underline' : 'text-zinc-700'}`}
-                          >
-                            {p.title || 'Untitled role'}
-                          </a>
-                          <div className="mt-1 text-xs text-zinc-600">
-                            {p.department ? `${p.department} · ` : ''}{p.location || 'Location n/a'}
-                          </div>
-                        </div>
-                        <div className="shrink-0 text-right text-[11px] text-zinc-500 whitespace-nowrap">
-                          {p.updated_at
-                            ? new Date(p.updated_at).toLocaleString()
-                            : (p.created_at ? new Date(p.created_at).toLocaleString() : '')}
-                        </div>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-    </main>
-  )
-}
+    # Names
+    if out:
+        ids = [o["company_id"] for o in out]
+        q = text("SELECT id, name FROM companies WHERE id = ANY(:ids)")
+        name_rows = db.execute(q, {"ids": ids}).fetchall()
+        names = {r[0]: r[1] for r in name_rows}
+        for o in out:
+            o["company_name"] = names.get(o["company_id"], "Unknown")
+
+    out.sort(key=lambda x: (-x["score"], x["company_name"]))
+    return out
+
+
+# -----------------------------
+# Forecast (stub kept for compatibility)
+# -----------------------------
+@app.get("/forecast/{company_id}")
+def forecast_company(company_id: int, db: Session = Depends(get_db)):
+    # Plug your model here as needed
+    return {"company_id": company_id, "ok": True, "note": "forecast stub"}
