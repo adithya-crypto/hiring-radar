@@ -1,7 +1,9 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from typing import Optional
+
+from backend import app
 from ..db import SessionLocal
 
 from ..connectors.greenhouse import fetch_greenhouse
@@ -99,3 +101,7 @@ def run_ingest():
 @router.post("/forecast")
 def run_forecast():
     return {"ok": True, "note": "forecast job stub"}
+
+@app.exception_handler(Exception)
+async def all_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"ok": False, "error": type(exc).__name__, "detail": str(exc)})

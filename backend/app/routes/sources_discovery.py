@@ -13,7 +13,7 @@ class DiscoverByUrlIn(BaseModel):
     display_name: Optional[str] = None
 
 class DiscoverByDomainIn(BaseModel):
-    domain: str   # 'example.com' or 'https://example.com'
+    domain: str
     display_name: Optional[str] = None
 
 def upsert_source(db, kind: str, handle: str, display_name: Optional[str]):
@@ -27,51 +27,37 @@ def upsert_source(db, kind: str, handle: str, display_name: Optional[str]):
     db.commit()
 
 def parse_ats_from_url(u: str):
-    """
-    Return (kind, handle) if url itself is an ATS board url; else None.
-    """
     try:
         p = urlparse(u)
         host = (p.netloc or "").lower()
         path = (p.path or "/").strip("/")
 
         if host.endswith("boards.greenhouse.io"):
-            # boards.greenhouse.io/<token>/...
             handle = path.split("/")[0] if path else None
-            if handle:
-                return ("greenhouse", handle)
+            if handle: return ("greenhouse", handle)
 
         if host.endswith("jobs.lever.co"):
-            # jobs.lever.co/<handle>/...
             handle = path.split("/")[0] if path else None
-            if handle:
-                return ("lever", handle)
+            if handle: return ("lever", handle)
 
         if host.endswith("jobs.ashbyhq.com"):
-            # jobs.ashbyhq.com/<org>/...
             handle = path.split("/")[0] if path else None
-            if handle:
-                return ("ashby", handle)
+            if handle: return ("ashby", handle)
 
         if host.endswith("api.ashbyhq.com"):
-            # api.ashbyhq.com/...organizationSlug=<org>
             qs = parse_qs(p.query or "")
             org = qs.get("organizationSlug", [None])[0]
-            if org:
-                return ("ashby", org)
+            if org: return ("ashby", org)
 
         if host.endswith("careers.smartrecruiters.com"):
-            # careers.smartrecruiters.com/<CompanyId>/...
             handle = path.split("/")[0] if path else None
-            if handle:
-                return ("smartrecruiters", handle)
+            if handle: return ("smartrecruiters", handle)
     except Exception:
         pass
     return None
 
 @router.post("/discover/url")
 def discover_from_url(body: DiscoverByUrlIn):
-    # 1) Try parsing the URL itself (works for direct ATS board URLs)
     direct = parse_ats_from_url(body.url)
     if direct:
         kind, handle = direct
@@ -79,7 +65,6 @@ def discover_from_url(body: DiscoverByUrlIn):
         upsert_source(db, kind, handle, body.display_name)
         return {"ok": True, "kind": kind, "handle": handle, "via": "url_parse"}
 
-    # 2) Fallback: fetch HTML and scan for links
     html = fetch(body.url)
     if not html:
         raise HTTPException(400, "could_not_fetch_url_or_non_2xx")

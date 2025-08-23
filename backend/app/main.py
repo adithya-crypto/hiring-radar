@@ -292,47 +292,27 @@ def active_top_new(
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
 ):
-    """
-    Top 'new' companies created in the last {days} days.
-    - Counts SWE/SDE postings per company
-    - score := 3*sde_new + min(sde_openings, 50)
-    - open_count := total SWE/SDE postings (treated as open)
-    """
     try:
         sql = text("""
             SELECT
               c.id   AS company_id,
               c.name AS company_name,
-
-              -- total SWE/SDE postings for the company
-              SUM(CASE
-                    WHEN lower(COALESCE(jp.role_family, '')) IN ('swe','software','sde')
-                    THEN 1 ELSE 0
-                  END)::int AS sde_openings,
-
-              -- postings considered "new" in the last :days
-              SUM(CASE
-                    WHEN lower(COALESCE(jp.role_family, '')) IN ('swe','software','sde')
-                     AND COALESCE(jp.updated_at, jp.created_at) > (now() - make_interval(days => :days))
-                    THEN 1 ELSE 0
-                  END)::int AS sde_new
-
+              SUM(CASE WHEN lower(COALESCE(jp.role_family, '')) IN ('swe','software','sde')
+                       THEN 1 ELSE 0 END)::int AS sde_openings,
+              SUM(CASE WHEN lower(COALESCE(jp.role_family, '')) IN ('swe','software','sde')
+                        AND COALESCE(jp.updated_at, jp.created_at) > (now() - make_interval(days => :days))
+                       THEN 1 ELSE 0 END)::int AS sde_new
             FROM companies c
-            LEFT JOIN job_postings jp
-              ON jp.company_id = c.id
+            LEFT JOIN job_postings jp ON jp.company_id = c.id
             WHERE c.created_at > (now() - make_interval(days => :days))
             GROUP BY c.id, c.name
             HAVING
-              SUM(CASE
-                    WHEN lower(COALESCE(jp.role_family, '')) IN ('swe','software','sde')
-                     AND COALESCE(jp.updated_at, jp.created_at) > (now() - make_interval(days => :days))
-                    THEN 1 ELSE 0
-                  END) > 0
+              SUM(CASE WHEN lower(COALESCE(jp.role_family, '')) IN ('swe','software','sde')
+                        AND COALESCE(jp.updated_at, jp.created_at) > (now() - make_interval(days => :days))
+                       THEN 1 ELSE 0 END) > 0
               OR
-              SUM(CASE
-                    WHEN lower(COALESCE(jp.role_family, '')) IN ('swe','software','sde')
-                    THEN 1 ELSE 0
-                  END) > 0
+              SUM(CASE WHEN lower(COALESCE(jp.role_family, '')) IN ('swe','software','sde')
+                       THEN 1 ELSE 0 END) > 0
             ORDER BY sde_new DESC, sde_openings DESC, c.name
             LIMIT :limit
         """)
@@ -349,7 +329,6 @@ def active_top_new(
                 "sde_openings": sde_open,
                 "sde_new": sde_new,
                 "sde_closed": 0,
-                # UI fields:
                 "score": score,
                 "open_count": sde_open,
                 "details_json": {
@@ -361,10 +340,7 @@ def active_top_new(
             })
         return out
     except Exception as e:
-        print("[/active_top_new] error:", repr(e))
-        return JSONResponse(
-            status_code=500, content={"error": "active_top_new_failed", "detail": str(e)}
-        )
+        return JSONResponse(status_code=500, content={"error":"active_top_new_failed","detail":str(e)})
 
 
 # -----------------------------
