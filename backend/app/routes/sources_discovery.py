@@ -12,10 +12,10 @@ class DiscoverByUrlIn(BaseModel):
     display_name: Optional[str] = None
 
 class DiscoverByDomainIn(BaseModel):
-    domain: str
+    domain: str   # 'example.com' or 'https://example.com'
     display_name: Optional[str] = None
 
-def upsert_source(db, kind: str, handle: str, display_name: str | None):
+def upsert_source(db, kind: str, handle: str, display_name: Optional[str]):
     db.execute(text("""
       INSERT INTO sources(kind, handle, display_name, enabled)
       VALUES (:k, :h, :n, true)
@@ -29,10 +29,10 @@ def upsert_source(db, kind: str, handle: str, display_name: str | None):
 def discover_from_url(body: DiscoverByUrlIn):
     html = fetch(body.url)
     if not html:
-        raise HTTPException(400, "could not fetch url or non-2xx")
+        raise HTTPException(400, "could_not_fetch_url_or_non_2xx")
     hit = detect_from_html(html)
     if not hit:
-        raise HTTPException(404, "no ATS link found in page")
+        raise HTTPException(404, "no_ats_link_found_in_page")
     kind, handle = hit
     db = SessionLocal()
     upsert_source(db, kind, handle, body.display_name)
@@ -42,7 +42,7 @@ def discover_from_url(body: DiscoverByUrlIn):
 def discover_from_domain_route(body: DiscoverByDomainIn):
     hit = detect_from_domain(body.domain)
     if not hit:
-        raise HTTPException(404, "no ATS detected from common paths")
+        raise HTTPException(404, "no_ats_detected_from_common_paths")
     kind, handle, name = hit
     db = SessionLocal()
     upsert_source(db, kind, handle, body.display_name or name)

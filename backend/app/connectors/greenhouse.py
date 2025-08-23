@@ -2,15 +2,9 @@ import requests
 from typing import Iterator, Dict
 
 def fetch_greenhouse(board_token: str) -> Iterator[Dict]:
-    """
-    Pulls published jobs from Greenhouse Job Board API for a given board token.
-    Normalizes a minimal posting record.
-    """
     url = f"https://boards-api.greenhouse.io/v1/boards/{board_token}/jobs?content=true"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    data = r.json().get("jobs", []) or []
-    for j in data:
+    r = requests.get(url, timeout=30); r.raise_for_status()
+    for j in (r.json().get("jobs") or []):
         dept = (j.get("departments") or [{}])[0].get("name")
         loc  = (j.get("location") or {}).get("name")
         yield {

@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 from sqlalchemy import text
-from typing import Optional  # <-- Py3.8-safe unions
+from typing import Optional
 from ..db import SessionLocal
 
 from ..connectors.greenhouse import fetch_greenhouse
@@ -33,7 +33,6 @@ def get_or_create_company_id(db, kind: str, handle: str, display_name: Optional[
     ), {"k": kind, "h": handle}).first()
     if row:
         return row[0]
-
     name = display_name or handle
     row = db.execute(text("""
         INSERT INTO companies (name, ats_kind, ats_handle)
@@ -43,7 +42,6 @@ def get_or_create_company_id(db, kind: str, handle: str, display_name: Optional[
     """), {"name": name, "k": kind, "h": handle}).first()
     if row:
         return row[0]
-
     return db.execute(text(
         "SELECT id FROM companies WHERE ats_kind=:k AND ats_handle=:h"
     ), {"k": kind, "h": handle}).first()[0]

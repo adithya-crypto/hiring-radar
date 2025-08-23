@@ -2,13 +2,9 @@ import requests
 from typing import Iterator, Dict
 
 def fetch_lever(company_handle: str) -> Iterator[Dict]:
-    """
-    Pulls published jobs from Lever v0 postings endpoint for a given company handle.
-    """
     url = f"https://api.lever.co/v0/postings/{company_handle}?mode=json"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    for j in r.json() or []:
+    r = requests.get(url, timeout=30); r.raise_for_status()
+    for j in (r.json() or []):
         cats = j.get("categories") or {}
         yield {
             "source": "lever",
