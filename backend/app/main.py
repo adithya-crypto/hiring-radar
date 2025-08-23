@@ -13,8 +13,31 @@ from .config import settings
 from . import crud
 from .forecast import forecast_month
 from .models import Signal
-from .jobs.run_discovery import run_discovery_now
 from .db import SessionLocal  # used to define local get_db
+
+# Routers
+from .routes.tasks import router as tasks_router
+from .routes.companies_live import router as companies_live_router
+from .routes.sources_admin import router as sources_admin_router
+from .routes.sources_discovery import router as sources_discovery_router
+
+# ---------- FastAPI app ----------
+app = FastAPI(title="Hiring Radar API", version="0.1.0")
+
+# ---------- CORS ----------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=getattr(settings, "ALLOWED_ORIGINS", ["*"]),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- Register routers (after app is created) ----------
+app.include_router(tasks_router)              # /tasks/ingest, /tasks/forecast
+app.include_router(companies_live_router)     # /live/companies
+app.include_router(sources_admin_router)      # /admin/sources/bulk
+app.include_router(sources_discovery_router)  # /admin/sources/discover/*
 
 # ---------- DB session dependency ----------
 def get_db():
@@ -26,36 +49,9 @@ def get_db():
 
 # Optional scheduler (hourly ingest / daily forecast)
 try:
-    from .jobs.scheduler import attach_scheduler
+    from .jobs.scheduler import attach_scheduler  # if you have one
 except Exception:
     attach_scheduler = None
-
-# -----------------------------
-# FastAPI app
-# -----------------------------
-app = FastAPI(title="Hiring Radar API", version="0.1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -----------------------------
-# Request models
-# -----------------------------
-class CompanyIn(BaseModel):
-    name: str
-    careers_url: str
-    ats_kind: str  # "greenhouse" | "lever" | "ashby" | "smartrecruiters"
-
-class SignalIn(BaseModel):
-    company_id: int
-    kind: str  # "hn_whos_hiring" | "layoff" | "funding" | "earnings"
-    happened_at: datetime
-    payload_json: Optional[Dict[str, Any]] = None
 
 # -----------------------------
 # Health
@@ -72,6 +68,11 @@ def health_db(db: Session = Depends(get_db)):
 # -----------------------------
 # Companies
 # -----------------------------
+class CompanyIn(BaseModel):
+    name: str
+    careers_url: str
+    ats_kind: str  # "greenhouse" | "lever" | "ashby" | "smartrecruiters"
+
 @app.get("/companies")
 def list_companies(db: Session = Depends(get_db)):
     return crud.list_companies(db)
@@ -122,6 +123,12 @@ def company_postings(
 # -----------------------------
 # Signals
 # -----------------------------
+class SignalIn(BaseModel):
+    company_id: int
+    kind: str  # "hn_whos_hiring" | "layoff" | "funding" | "earnings"
+    happened_at: datetime
+    payload_json: Optional[Dict[str, Any]] = None
+
 @app.post("/signals")
 def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
     s = Signal(
@@ -135,10 +142,36 @@ def add_signal(payload: SignalIn, db: Session = Depends(get_db)):
     db.refresh(s)
     return {"ok": True, "id": s.id}
 
+from sqlalchemy import text
+from fastapi import Query
+from sqlalchemy.orm import Session
+
+@app.get("/live/companies")
+def live_companies(
+    limit: int = Query(50, ge=1, le=1000),
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    rows = db.execute(text("""
+      SELECT
+        c.id,
+        c.name,
+        c.ats_kind,
+        c.ats_handle,
+        COUNT(*) FILTER (WHERE jp.status='OPEN') AS open_roles,
+        MAX(jp.updated_at) AS last_update
+      FROM job_postings jp
+      JOIN companies c ON c.id = jp.company_id
+      GROUP BY c.id, c.name, c.ats_kind, c.ats_handle
+      ORDER BY last_update DESC
+      LIMIT :limit OFFSET :offset
+    """), {"limit": limit, "offset": offset}).mappings().all()
+    return [dict(r) for r in rows]
+
+
 # -----------------------------
 # Scores / Active
 # -----------------------------
-# Weighted score so "Score (New)" != "New (28d)"
 def compute_activity_score(sde_new: int, sde_openings: int) -> int:
     # Emphasize recent activity, cap openings influence so whales don't dominate
     return 3 * int(sde_new or 0) + min(int(sde_openings or 0), 50)
@@ -319,47 +352,6 @@ def active_top_new(
     except Exception as e:
         print("[/active_top_new] error:", repr(e))
         return {"error": "active_top_new_failed", "detail": str(e)}
-
-# -----------------------------
-# Tasks: discover / ingest / forecast
-# -----------------------------
-@app.post("/tasks/discover")
-def run_discover(db: Session = Depends(get_db)):
-    try:
-        disc = run_discovery_now(db)
-        # Chain ingest + forecast
-        try:
-            from .jobs.run_ingest import run_ingest_now
-            ing = run_ingest_now(db)
-        except Exception as e:
-            ing = {"error": f"ingest_failed: {e}"}
-        try:
-            from .jobs.run_forecast import run_forecast_now
-            fc = {"forecasted": run_forecast_now(db)}
-        except Exception as e:
-            fc = {"error": f"forecast_failed: {e}"}
-        return {"discover": disc, "ingest": ing, "forecast": fc}
-    except Exception as e:
-        return {"error": "discover_failed", "detail": str(e)}
-
-@app.post("/tasks/ingest")
-def run_ingest(db: Session = Depends(get_db)):
-    try:
-        from .jobs.run_ingest import run_ingest_now
-        result = run_ingest_now(db)
-        return result
-    except Exception as e:
-        return {"error": "ingest_failed", "detail": str(e)}
-
-@app.post("/tasks/forecast")
-def run_forecast(db: Session = Depends(get_db)):
-    try:
-        from .jobs.run_forecast import run_forecast_now
-        n = run_forecast_now(db)
-        return {"forecasted": n}
-    except Exception as e:
-        tb = traceback.format_exc()
-        return {"error": "forecast_failed", "detail": str(e), "trace": tb}
 
 # -----------------------------
 # Forecast (per company) & debug
