@@ -20,7 +20,7 @@ class Settings:
 
     # CORS
     # Comma-separated list. Defaults to localhost:3000 for the Next.js app.
-    ALLOWED_ORIGINS: List[str] = _csv("ALLOWED_ORIGINS", "http://localhost:3000", "https://hiring-radar.vercel.app")
+    ALLOWED_ORIGINS: List[str] = _csv("ALLOWED_ORIGINS", "http://localhost:3000, https://hiring-radar.vercel.app")
 
     # You can add other toggles here if you want:
     DEBUG: bool = os.environ.get("DEBUG", "false").lower() in ("1", "true", "yes")
