@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, bindparam
 
 from .config import settings
 from . import crud
@@ -390,7 +390,8 @@ def scores_live(
     # Attach company names for UI
     if out:
         ids = tuple([o["company_id"] for o in out])
-        q = text("SELECT id, name FROM companies WHERE id = ANY(:ids)")
+        q = text("SELECT id, name FROM companies WHERE id IN :ids")
+        q = q.bindparams(bindparam("ids", expanding=True))
         names = {r[0]: r[1] for r in db.execute(q, {"ids": list(ids)}).fetchall()}
         for o in out:
             o["company_name"] = names.get(o["company_id"], f"id:{o['company_id']}")
